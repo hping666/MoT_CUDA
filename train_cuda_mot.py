@@ -11,6 +11,11 @@ Only trains the router and interaction layers (experts are frozen).
 FIXES:
 - Updated to pass raw_texts to model for multi-tokenizer support
 - Fixed batch handling for different vocab sizes across experts
+- Added consistency loss logging and tracking
+- Added Gumbel-Softmax support
+- Added use_mot_generate option for full MoT inference mode
+- Added best_model_metric option to control which metric is used for best model selection
+- Added dual final evaluation (last epoch + best model)
 """
 
 import os
@@ -59,22 +64,30 @@ DEFAULT_CONFIG = {
     'use_4bit': True,
     'num_stacks': 4,
     'top_k': 2,
-    'single_gpu': True,  # Load all models on single GPU (recommended for MoT)
+    'single_gpu': True,
     
     # Training settings
     'batch_size': 1,
     'gradient_accumulation_steps': 8,
     'num_epochs': 3,
-    'learning_rate': 5e-6,  # Reduced from 1e-4 for stability
+    'learning_rate': 5e-6,
     'warmup_steps': 200,
-    'max_length': 1024,  # Reduced from 2048 for memory
-    'max_new_tokens': 512,
-    'gradient_clip': 0.3,  # Reduced from 1.0 for stability
+    'max_length': 512,
+    'max_new_tokens': 256,
+    'gradient_clip': 0.3,
+    
+    # Loss weights
+    'lambda_consistency': 0.05,
     
     # Evaluation settings
     'eval_steps': 100,
     'eval_samples': 50,
     'eval_only': False,
+    'best_model_metric': 'bleu',  # Metric for best model selection: bleu, chrf, rouge_l, exact_match, edit_similarity
+    
+    # Generation settings
+    'use_mot_generate': False,  # If True, use full MoT generation (slow); if False, use fast mode
+    'prompt_template': "### Translate C++ to CUDA:\n{source}\n### CUDA:\n",  # Template for code translation
     
     # Output settings
     'output_dir': './cuda_mot_output',
@@ -87,8 +100,11 @@ DEFAULT_CONFIG = {
     'logging_steps': 10,
 }
 
+# Valid metrics for best model selection
+VALID_BEST_MODEL_METRICS = ['bleu', 'chrf', 'rouge_l', 'exact_match', 'edit_similarity']
+
 # =============================================================================
-# EXPERT MODEL CONFIGURATION - Modify model list here
+# EXPERT MODEL CONFIGURATION
 # =============================================================================
 # EXPERT_MODELS = [
 #     {
@@ -104,7 +120,6 @@ DEFAULT_CONFIG = {
 #         'description': 'StarCoder2 7B - Multi-language code generation',
 #     },
 # ]
-
 EXPERT_MODELS = [
     {
         'name': 'Qwen/Qwen2.5-Coder-1.5B',  
@@ -129,190 +144,99 @@ def parse_args():
     )
     
     # Data arguments
-    parser.add_argument(
-        '--data_path',
-        type=str,
-        default=DEFAULT_CONFIG['data_path'],
-        help='Path to the JSONL dataset file'
-    )
-    parser.add_argument(
-        '--train_ratio',
-        type=float,
-        default=DEFAULT_CONFIG['train_ratio'],
-        help='Ratio of data to use for training (0.0 to 1.0+)'
-    )
-    parser.add_argument(
-        '--test_ratio',
-        type=float,
-        default=DEFAULT_CONFIG['test_ratio'],
-        help='Ratio of data to use for testing (0.0 to 1.0+)'
-    )
+    parser.add_argument('--data_path', type=str, default=DEFAULT_CONFIG['data_path'],
+                        help='Path to the JSONL dataset file')
+    parser.add_argument('--train_ratio', type=float, default=DEFAULT_CONFIG['train_ratio'],
+                        help='Ratio of data to use for training')
+    parser.add_argument('--test_ratio', type=float, default=DEFAULT_CONFIG['test_ratio'],
+                        help='Ratio of data to use for testing')
     
     # Model arguments
-    parser.add_argument(
-        '--use_8bit',
-        action='store_true',
-        default=DEFAULT_CONFIG['use_8bit'],
-        help='Load models in 8-bit quantization to save memory'
-    )
-    parser.add_argument(
-        '--use_4bit',
-        action='store_true',
-        default=DEFAULT_CONFIG['use_4bit'],
-        help='Load models in 4-bit quantization to save more memory'
-    )
-    parser.add_argument(
-        '--num_stacks',
-        type=int,
-        default=DEFAULT_CONFIG['num_stacks'],
-        help='Number of stacks to divide expert layers into'
-    )
-    parser.add_argument(
-        '--top_k',
-        type=int,
-        default=DEFAULT_CONFIG['top_k'],
-        help='Number of experts to activate per forward pass'
-    )
-    parser.add_argument(
-        '--single_gpu',
-        action='store_true',
-        default=DEFAULT_CONFIG['single_gpu'],
-        help='Load all models on single GPU (recommended). Disable for multi-GPU DDP.'
-    )
-    parser.add_argument(
-        '--no_single_gpu',
-        action='store_true',
-        help='Disable single_gpu mode (use device_map="auto" for multi-GPU)'
-    )
+    parser.add_argument('--use_8bit', action='store_true', default=DEFAULT_CONFIG['use_8bit'],
+                        help='Load models in 8-bit quantization')
+    parser.add_argument('--use_4bit', action='store_true', default=DEFAULT_CONFIG['use_4bit'],
+                        help='Load models in 4-bit quantization')
+    parser.add_argument('--num_stacks', type=int, default=DEFAULT_CONFIG['num_stacks'],
+                        help='Number of stacks to divide expert layers into')
+    parser.add_argument('--top_k', type=int, default=DEFAULT_CONFIG['top_k'],
+                        help='Number of experts to activate per forward pass')
+    parser.add_argument('--single_gpu', action='store_true', default=DEFAULT_CONFIG['single_gpu'],
+                        help='Load all models on single GPU')
+    parser.add_argument('--no_single_gpu', action='store_true',
+                        help='Disable single_gpu mode')
     
     # Training arguments
-    parser.add_argument(
-        '--batch_size',
-        type=int,
-        default=DEFAULT_CONFIG['batch_size'],
-        help='Training batch size'
-    )
-    parser.add_argument(
-        '--gradient_accumulation_steps',
-        type=int,
-        default=DEFAULT_CONFIG['gradient_accumulation_steps'],
-        help='Number of gradient accumulation steps'
-    )
-    parser.add_argument(
-        '--num_epochs',
-        type=int,
-        default=DEFAULT_CONFIG['num_epochs'],
-        help='Number of training epochs'
-    )
-    parser.add_argument(
-        '--learning_rate',
-        type=float,
-        default=DEFAULT_CONFIG['learning_rate'],
-        help='Learning rate'
-    )
-    parser.add_argument(
-        '--warmup_steps',
-        type=int,
-        default=DEFAULT_CONFIG['warmup_steps'],
-        help='Number of warmup steps'
-    )
-    parser.add_argument(
-        '--max_length',
-        type=int,
-        default=DEFAULT_CONFIG['max_length'],
-        help='Maximum sequence length for training'
-    )
-    parser.add_argument(
-        '--max_new_tokens',
-        type=int,
-        default=DEFAULT_CONFIG['max_new_tokens'],
-        help='Maximum new tokens to generate during evaluation'
-    )
-    parser.add_argument(
-        '--gradient_clip',
-        type=float,
-        default=DEFAULT_CONFIG['gradient_clip'],
-        help='Gradient clipping value'
-    )
+    parser.add_argument('--batch_size', type=int, default=DEFAULT_CONFIG['batch_size'],
+                        help='Training batch size')
+    parser.add_argument('--gradient_accumulation_steps', type=int, 
+                        default=DEFAULT_CONFIG['gradient_accumulation_steps'],
+                        help='Number of gradient accumulation steps')
+    parser.add_argument('--num_epochs', type=int, default=DEFAULT_CONFIG['num_epochs'],
+                        help='Number of training epochs')
+    parser.add_argument('--learning_rate', type=float, default=DEFAULT_CONFIG['learning_rate'],
+                        help='Learning rate')
+    parser.add_argument('--warmup_steps', type=int, default=DEFAULT_CONFIG['warmup_steps'],
+                        help='Number of warmup steps')
+    parser.add_argument('--max_length', type=int, default=DEFAULT_CONFIG['max_length'],
+                        help='Maximum sequence length for training')
+    parser.add_argument('--max_new_tokens', type=int, default=DEFAULT_CONFIG['max_new_tokens'],
+                        help='Maximum new tokens to generate during evaluation')
+    parser.add_argument('--gradient_clip', type=float, default=DEFAULT_CONFIG['gradient_clip'],
+                        help='Gradient clipping value')
+    parser.add_argument('--lambda_consistency', type=float, default=DEFAULT_CONFIG['lambda_consistency'],
+                        help='Weight for routing consistency loss')
     
     # Evaluation arguments
-    parser.add_argument(
-        '--eval_steps',
-        type=int,
-        default=DEFAULT_CONFIG['eval_steps'],
-        help='Evaluate every N steps'
-    )
-    parser.add_argument(
-        '--eval_samples',
-        type=int,
-        default=DEFAULT_CONFIG['eval_samples'],
-        help='Number of samples to evaluate during training'
-    )
-    parser.add_argument(
-        '--eval_only',
-        action='store_true',
-        default=DEFAULT_CONFIG['eval_only'],
-        help='Only run evaluation (no training)'
-    )
+    parser.add_argument('--eval_steps', type=int, default=DEFAULT_CONFIG['eval_steps'],
+                        help='Evaluate every N steps')
+    parser.add_argument('--eval_samples', type=int, default=DEFAULT_CONFIG['eval_samples'],
+                        help='Number of samples to evaluate during training')
+    parser.add_argument('--eval_only', action='store_true', default=DEFAULT_CONFIG['eval_only'],
+                        help='Only run evaluation (no training)')
+    parser.add_argument('--best_model_metric', type=str, default=DEFAULT_CONFIG['best_model_metric'],
+                        choices=VALID_BEST_MODEL_METRICS,
+                        help='Metric used for best model selection: bleu, chrf, rouge_l, exact_match, edit_similarity')
+    
+    # Generation arguments
+    parser.add_argument('--use_mot_generate', action='store_true', default=DEFAULT_CONFIG['use_mot_generate'],
+                        help='Use full MoT generation mode (slow but uses expert interaction). '
+                             'If not set, use fast mode (only routing, expert generates independently)')
+    parser.add_argument('--no_mot_generate', action='store_true',
+                        help='Force fast generation mode (disable MoT generation)')
+    parser.add_argument('--prompt_template', type=str, default=DEFAULT_CONFIG['prompt_template'],
+                        help='Prompt template for code translation. Use {source} as placeholder for input code')
     
     # Output arguments
-    parser.add_argument(
-        '--output_dir',
-        type=str,
-        default=DEFAULT_CONFIG['output_dir'],
-        help='Directory to save outputs'
-    )
-    parser.add_argument(
-        '--checkpoint_path',
-        type=str,
-        default=DEFAULT_CONFIG['checkpoint_path'],
-        help='Path to checkpoint to load'
-    )
-    parser.add_argument(
-        '--save_steps',
-        type=int,
-        default=DEFAULT_CONFIG['save_steps'],
-        help='Save checkpoint every N steps'
-    )
+    parser.add_argument('--output_dir', type=str, default=DEFAULT_CONFIG['output_dir'],
+                        help='Directory to save outputs')
+    parser.add_argument('--checkpoint_path', type=str, default=DEFAULT_CONFIG['checkpoint_path'],
+                        help='Path to checkpoint to load')
+    parser.add_argument('--save_steps', type=int, default=DEFAULT_CONFIG['save_steps'],
+                        help='Save checkpoint every N steps')
     
     # Other arguments
-    parser.add_argument(
-        '--seed',
-        type=int,
-        default=DEFAULT_CONFIG['seed'],
-        help='Random seed'
-    )
-    parser.add_argument(
-        '--num_workers',
-        type=int,
-        default=DEFAULT_CONFIG['num_workers'],
-        help='Number of data loading workers'
-    )
-    parser.add_argument(
-        '--logging_steps',
-        type=int,
-        default=DEFAULT_CONFIG['logging_steps'],
-        help='Log every N steps'
-    )
+    parser.add_argument('--seed', type=int, default=DEFAULT_CONFIG['seed'],
+                        help='Random seed')
+    parser.add_argument('--num_workers', type=int, default=DEFAULT_CONFIG['num_workers'],
+                        help='Number of data loading workers')
+    parser.add_argument('--logging_steps', type=int, default=DEFAULT_CONFIG['logging_steps'],
+                        help='Log every N steps')
     
     return parser.parse_args()
 
 
 def load_expert_models(args) -> Tuple[List[Any], List[Any]]:
-    """Load the three expert models."""
+    """Load the expert models."""
     print("\n" + "=" * 60)
     print("Loading Expert Models")
     print("=" * 60)
     
-    # Determine single_gpu mode
     single_gpu = args.single_gpu and not args.no_single_gpu
     
     if single_gpu:
         print("  Mode: Single GPU (all models on cuda:0)")
-        print("  This is recommended for MoT stack-based forward.")
     else:
         print("  Mode: Multi-GPU (device_map='auto')")
-        print("  WARNING: This may cause device mismatch errors with stack-based forward!")
     
     expert_configs = []
     
@@ -330,32 +254,23 @@ def load_expert_models(args) -> Tuple[List[Any], List[Any]]:
         print(f"  - {model_info['name']}: {model_info['description']}")
     
     print()
-    
-    # Load models
     models, tokenizers = ExpertLoader.load_multiple_experts(expert_configs)
-    
     return models, tokenizers
 
 
-def setup_mot_model(
-    expert_models: List[Any],
-    tokenizers: List[Any],
-    args
-) -> MixtureOfThoughts:
+def setup_mot_model(expert_models: List[Any], tokenizers: List[Any], args) -> MixtureOfThoughts:
     """Initialize the MoT model."""
     print("\n" + "=" * 60)
     print("Initializing MoT Framework")
     print("=" * 60)
     
-    # Get hidden dimensions from models
     hidden_dims = []
     for model in expert_models:
         if hasattr(model.config, 'hidden_size'):
             hidden_dims.append(model.config.hidden_size)
         else:
-            hidden_dims.append(4096)  # Default for 7B models
+            hidden_dims.append(4096)
     
-    # Use the minimum hidden dim for shared space
     shared_dim = min(hidden_dims)
     
     config = MoTConfig(
@@ -367,6 +282,10 @@ def setup_mot_model(
         interaction_heads=8,
         enable_auxiliary_loss=True,
         dropout_rate=0.1,
+        use_gumbel=True,
+        gumbel_temperature=1.0,
+        lambda_consistency=args.lambda_consistency,
+        consistency_temperature=2.0,
     )
     
     print(f"  MoT Configuration:")
@@ -374,15 +293,15 @@ def setup_mot_model(
     print(f"    - Top-K experts: {config.top_k}")
     print(f"    - Shared dimension: {config.shared_dim}")
     print(f"    - Interaction heads: {config.interaction_heads}")
+    print(f"    - Use Gumbel-Softmax: {config.use_gumbel}")
+    print(f"    - Consistency loss weight: {config.lambda_consistency}")
     
-    # Initialize model
     model = MixtureOfThoughts(
         expert_models=expert_models,
         tokenizers=tokenizers,
         config=config
     )
     
-    # Print model statistics
     stats = compute_model_size(model)
     print(f"\n  Model Statistics:")
     print(f"    - Total parameters: {stats['total_params_M']:.2f}M")
@@ -394,7 +313,6 @@ def setup_mot_model(
 
 def setup_optimizer(model: nn.Module, args) -> Tuple[torch.optim.Optimizer, Any]:
     """Setup optimizer with different learning rates for different components."""
-    # Collect trainable parameters by component
     router_params = []
     interaction_params = []
     auxiliary_params = []
@@ -411,7 +329,6 @@ def setup_optimizer(model: nn.Module, args) -> Tuple[torch.optim.Optimizer, Any]
             else:
                 other_params.append(param)
     
-    # Different learning rates for different components
     param_groups = []
     if router_params:
         param_groups.append({'params': router_params, 'lr': args.learning_rate * 2.0, 'name': 'router'})
@@ -423,13 +340,7 @@ def setup_optimizer(model: nn.Module, args) -> Tuple[torch.optim.Optimizer, Any]
         param_groups.append({'params': other_params, 'lr': args.learning_rate, 'name': 'other'})
     
     optimizer = AdamW(param_groups, weight_decay=0.01)
-    
-    # Setup scheduler
-    scheduler = CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=args.warmup_steps,
-        T_mult=2
-    )
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=args.warmup_steps, T_mult=2)
     
     return optimizer, scheduler
 
@@ -443,56 +354,50 @@ def train_step(
     step: int,
     accumulation_counter: int
 ) -> Dict[str, float]:
-    """Perform a single training step with multi-tokenizer support."""
+    """Perform a single training step."""
     model.train()
     device = next(model.parameters()).device
     
-    # Get raw texts from batch (required for multi-tokenizer support)
     raw_texts = batch.get('raw_full_text', None)
     prompt_lengths = batch.get('prompt_length', None)
     
     if raw_texts is None:
         raise ValueError("Batch must contain 'raw_full_text' for multi-tokenizer support")
     
-    # Move tensors to device (these are from primary tokenizer, used for reference)
     input_ids = batch['input_ids'].to(device)
     attention_mask = batch['attention_mask'].to(device)
     labels = batch['labels'].to(device)
     
-    # Forward pass with raw texts
     outputs = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         labels=labels,
         raw_texts=raw_texts,
         prompt_lengths=prompt_lengths,
-        return_dict=True
+        return_dict=True,
+        compute_consistency=True
     )
     
     loss = outputs['loss']
     
-    # Check for NaN loss
     if loss is None or torch.isnan(loss) or torch.isinf(loss):
         print(f"Warning: Skipping step {step} due to NaN/Inf loss")
         optimizer.zero_grad()
-        return {
-            'loss': float('nan'),
-            'skipped': True
-        }
+        return {'loss': float('nan'), 'skipped': True}
     
-    # Scale loss for gradient accumulation
     scaled_loss = loss / args.gradient_accumulation_steps
-    
-    # Backward pass
     scaled_loss.backward()
     
-    metrics = {
-        'loss': loss.item(),
-    }
+    metrics = {'loss': loss.item()}
     
-    # Optimizer step (only after accumulation)
+    if outputs.get('consistency_loss') is not None:
+        consistency_loss = outputs['consistency_loss']
+        if isinstance(consistency_loss, torch.Tensor):
+            metrics['consistency_loss'] = consistency_loss.item()
+        else:
+            metrics['consistency_loss'] = consistency_loss
+    
     if (accumulation_counter + 1) % args.gradient_accumulation_steps == 0:
-        # Check for NaN gradients before stepping
         has_nan_grad = False
         for name, param in model.named_parameters():
             if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
@@ -500,7 +405,7 @@ def train_step(
                 break
         
         if has_nan_grad:
-            print(f"Warning: NaN gradients detected at step {step}, skipping optimizer step")
+            print(f"Warning: NaN gradients at step {step}, skipping")
             optimizer.zero_grad()
             metrics['skipped'] = True
         else:
@@ -510,7 +415,6 @@ def train_step(
             optimizer.zero_grad()
             metrics['lr'] = optimizer.param_groups[0]['lr']
     
-    # Add routing information
     if 'router_scores' in outputs:
         router_scores = outputs['router_scores']
         probs = torch.softmax(router_scores, dim=-1)
@@ -539,37 +443,30 @@ def evaluate(
     expert_usage = {}
     
     evaluator = CudaCodeEvaluator()
-    
-    # Limit samples if specified
     max_samples = num_samples or len(test_dataloader)
     
-    print(f"\nEvaluating on {min(max_samples, len(test_dataloader))} samples...")
+    # Determine generation mode
+    use_mot_generate = args.use_mot_generate and not args.no_mot_generate
+    mode_str = "full MoT" if use_mot_generate else "fast"
+    print(f"\nEvaluating on {min(max_samples, len(test_dataloader))} samples (generation mode: {mode_str})...")
     
     for i, batch in enumerate(tqdm(test_dataloader, desc="Evaluating", total=min(max_samples, len(test_dataloader)))):
         if i >= max_samples:
             break
         
-        # Get raw text for generation
-        raw_prompt = batch.get('raw_prompt', None)
-        if raw_prompt is None:
-            # Fallback: use cpp_code to create prompt
-            cpp_code = batch['cpp_code'][0]
-            raw_prompt = [f"### Translate C++ to CUDA:\n{cpp_code}\n### CUDA:\n"]
-        
         reference_cuda = batch['cuda_code'][0]
         
-        # Generate CUDA code using the translate method
         try:
             generated_cuda, primary_idx = model.translate(
                 source_text=batch['cpp_code'][0],
+                prompt_template=args.prompt_template,
                 max_new_tokens=args.max_new_tokens,
                 temperature=0.7,
                 top_p=0.95,
+                use_mot_generate=use_mot_generate,
             )
             
-            # Track expert usage
             expert_usage[primary_idx] = expert_usage.get(primary_idx, 0) + 1
-            
             predictions.append(generated_cuda)
             references.append(reference_cuda)
             
@@ -578,36 +475,23 @@ def evaluate(
             predictions.append("")
             references.append(reference_cuda)
     
-    # Compute metrics
     if predictions:
         results = evaluator.evaluate_all(predictions, references)
         results['expert_usage'] = expert_usage
+        results['generation_mode'] = 'mot' if use_mot_generate else 'fast'
     else:
         results = {'error': 'No predictions generated'}
     
     return results
 
 
-def save_checkpoint(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: Any,
-    step: int,
-    epoch: int,
-    best_metric: float,
-    args,
-    is_best: bool = False
-):
+def save_checkpoint(model, optimizer, scheduler, step, epoch, best_metric, args, is_best=False):
     """Save model checkpoint."""
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Save only trainable components (router, interaction, auxiliary)
     save_state_dict = {}
     for name, param in model.state_dict().items():
-        if 'router' in name or 'interaction' in name or 'auxiliary' in name:
-            save_state_dict[name] = param
-        # Also save sentence_encoder if needed
-        if 'sentence_encoder' in name:
+        if 'router' in name or 'interaction' in name or 'auxiliary' in name or 'sentence_encoder' in name:
             save_state_dict[name] = param
     
     checkpoint = {
@@ -617,27 +501,25 @@ def save_checkpoint(
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'best_metric': best_metric,
+        'best_metric_name': args.best_model_metric,  # Store which metric was used
         'args': vars(args),
     }
     
-    # Save regular checkpoint
     checkpoint_path = os.path.join(args.output_dir, f'checkpoint-{step}.pt')
     torch.save(checkpoint, checkpoint_path)
     print(f"  Saved checkpoint: {checkpoint_path}")
     
-    # Save best model
     if is_best:
         best_path = os.path.join(args.output_dir, 'best_model.pt')
         torch.save(checkpoint, best_path)
-        print(f"  Saved best model: {best_path}")
+        print(f"  Saved best model: {best_path} (based on {args.best_model_metric})")
 
 
-def load_checkpoint(model: nn.Module, checkpoint_path: str, device: torch.device) -> Dict:
+def load_checkpoint(model, checkpoint_path, device):
     """Load model checkpoint."""
     print(f"Loading checkpoint from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
-    # Load only the saved parameters (router, interaction, auxiliary)
     model_state = model.state_dict()
     for name, param in checkpoint['model_state_dict'].items():
         if name in model_state:
@@ -647,34 +529,28 @@ def load_checkpoint(model: nn.Module, checkpoint_path: str, device: torch.device
     return checkpoint
 
 
-def train(
-    model: nn.Module,
-    train_dataloader: DataLoader,
-    test_dataloader: DataLoader,
-    tokenizers: List[Any],
-    args
-):
+def train(model, train_dataloader, test_dataloader, tokenizers, args):
     """Main training loop."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     
     print(f"\nUsing device: {device}")
     
-    # Setup optimizer and scheduler
     optimizer, scheduler = setup_optimizer(model, args)
     
-    # Training state
     global_step = 0
-    best_bleu = 0.0
+    best_metric_value = 0.0
     accumulation_counter = 0
     
-    # Load checkpoint if specified
     if args.checkpoint_path:
         checkpoint = load_checkpoint(model, args.checkpoint_path, device)
         global_step = checkpoint.get('step', 0)
-        best_bleu = checkpoint.get('best_metric', 0.0)
+        best_metric_value = checkpoint.get('best_metric', 0.0)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    # Determine generation mode
+    use_mot_generate = args.use_mot_generate and not args.no_mot_generate
     
     print("\n" + "=" * 60)
     print("Starting Training")
@@ -685,77 +561,73 @@ def train(
     print(f"  Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
     print(f"  Total steps per epoch: {len(train_dataloader)}")
     print(f"  Eval every {args.eval_steps} steps")
+    print(f"  Consistency loss weight: {args.lambda_consistency}")
+    print(f"  Generation mode: {'full MoT' if use_mot_generate else 'fast'}")
+    print(f"  Best model metric: {args.best_model_metric}")
     print()
     
-    # Training loop
     for epoch in range(1, args.num_epochs + 1):
         print(f"\nEpoch {epoch}/{args.num_epochs}")
         print("-" * 40)
         
         epoch_loss = 0.0
+        epoch_consistency_loss = 0.0
         epoch_steps = 0
         
         progress_bar = tqdm(train_dataloader, desc=f"Training")
         
         for batch_idx, batch in enumerate(progress_bar):
             try:
-                metrics = train_step(
-                    model, batch, optimizer, scheduler, args,
-                    global_step, accumulation_counter
-                )
+                metrics = train_step(model, batch, optimizer, scheduler, args, global_step, accumulation_counter)
                 
                 accumulation_counter += 1
                 global_step += 1
                 epoch_loss += metrics['loss']
+                if 'consistency_loss' in metrics:
+                    epoch_consistency_loss += metrics['consistency_loss']
                 epoch_steps += 1
                 
-                # Update progress bar
-                progress_bar.set_postfix({
+                postfix = {
                     'loss': f"{metrics['loss']:.4f}",
                     'lr': f"{metrics.get('lr', 0):.2e}",
                     'expert': metrics.get('primary_expert', -1)
-                })
+                }
+                if 'consistency_loss' in metrics:
+                    postfix['con_loss'] = f"{metrics['consistency_loss']:.4f}"
+                progress_bar.set_postfix(postfix)
                 
-                # Logging
                 if global_step % args.logging_steps == 0:
                     avg_loss = epoch_loss / epoch_steps
+                    avg_con_loss = epoch_consistency_loss / epoch_steps if epoch_steps > 0 else 0
                     print(f"\n  Step {global_step}: loss={avg_loss:.4f}, "
+                          f"consistency_loss={avg_con_loss:.4f}, "
                           f"router_entropy={metrics.get('router_entropy', 0):.3f}")
                 
-                # Evaluation
                 if global_step % args.eval_steps == 0:
-                    eval_results = evaluate(
-                        model, test_dataloader, tokenizers, args,
-                        num_samples=args.eval_samples
-                    )
+                    eval_results = evaluate(model, test_dataloader, tokenizers, args, num_samples=args.eval_samples)
                     
                     print(f"\n  Evaluation at step {global_step}:")
                     print(f"    BLEU: {eval_results.get('bleu', 0):.2f}")
                     print(f"    chrF: {eval_results.get('chrf', 0):.2f}")
                     print(f"    ROUGE-L: {eval_results.get('rouge_l', 0):.2f}")
                     print(f"    Exact Match: {eval_results.get('exact_match', 0):.2f}%")
+                    print(f"    Edit Similarity: {eval_results.get('edit_similarity', 0):.2f}%")
+                    print(f"    Generation mode: {eval_results.get('generation_mode', 'unknown')}")
                     if 'expert_usage' in eval_results:
                         print(f"    Expert usage: {eval_results['expert_usage']}")
                     
-                    # Save best model
-                    current_bleu = eval_results.get('bleu', 0)
-                    if current_bleu > best_bleu:
-                        best_bleu = current_bleu
-                        save_checkpoint(
-                            model, optimizer, scheduler,
-                            global_step, epoch, best_bleu, args,
-                            is_best=True
-                        )
+                    # Get current metric value based on best_model_metric setting
+                    current_metric_value = eval_results.get(args.best_model_metric, 0)
+                    print(f"    Current {args.best_model_metric}: {current_metric_value:.2f} (best: {best_metric_value:.2f})")
                     
-                    model.train()  # Back to training mode
+                    if current_metric_value > best_metric_value:
+                        best_metric_value = current_metric_value
+                        save_checkpoint(model, optimizer, scheduler, global_step, epoch, best_metric_value, args, is_best=True)
+                    
+                    model.train()
                 
-                # Save checkpoint
                 if global_step % args.save_steps == 0:
-                    save_checkpoint(
-                        model, optimizer, scheduler,
-                        global_step, epoch, best_bleu, args,
-                        is_best=False
-                    )
+                    save_checkpoint(model, optimizer, scheduler, global_step, epoch, best_metric_value, args, is_best=False)
                     
             except Exception as e:
                 print(f"\n  Error at step {global_step}: {e}")
@@ -763,13 +635,14 @@ def train(
                 traceback.print_exc()
                 continue
         
-        # End of epoch
         avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
-        print(f"\nEpoch {epoch} completed. Average loss: {avg_epoch_loss:.4f}")
+        avg_epoch_con_loss = epoch_consistency_loss / max(epoch_steps, 1)
+        print(f"\nEpoch {epoch} completed. Average loss: {avg_epoch_loss:.4f}, "
+              f"Average consistency loss: {avg_epoch_con_loss:.4f}")
     
     print("\n" + "=" * 60)
     print("Training Completed!")
-    print(f"Best BLEU score: {best_bleu:.2f}")
+    print(f"Best {args.best_model_metric} score: {best_metric_value:.2f}")
     print("=" * 60)
     
     return model
@@ -777,6 +650,9 @@ def train(
 
 def print_config(args):
     """Print current configuration."""
+    # Determine generation mode
+    use_mot_generate = args.use_mot_generate and not getattr(args, 'no_mot_generate', False)
+    
     print("\n" + "=" * 60)
     print("Current Configuration")
     print("=" * 60)
@@ -794,6 +670,10 @@ def print_config(args):
     print(f"  Top-K experts: {args.top_k}")
     print(f"  Use 8-bit: {args.use_8bit}")
     print(f"  Use 4-bit: {args.use_4bit}")
+    print(f"  Consistency loss weight: {args.lambda_consistency}")
+    print(f"  Best model metric: {args.best_model_metric}")
+    print(f"  Generation mode: {'full MoT (slow)' if use_mot_generate else 'fast'}")
+    print(f"  Prompt template: {args.prompt_template[:50]}...")
     print(f"  Output dir: {args.output_dir}")
     print(f"  Seed: {args.seed}")
     print("=" * 60)
@@ -803,28 +683,22 @@ def main():
     """Main entry point."""
     args = parse_args()
     
-    # Print configuration
     print_config(args)
     
-    # Set random seed
     set_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     
-    # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Save args
     with open(os.path.join(args.output_dir, 'args.json'), 'w') as f:
         json.dump(vars(args), f, indent=2)
     
-    # Check for data file
     if not os.path.exists(args.data_path):
         print(f"\nError: Data file not found: {args.data_path}")
         sys.exit(1)
     
-    # Print dataset statistics
     print("\n" + "=" * 60)
     print("Dataset Statistics")
     print("=" * 60)
@@ -837,7 +711,6 @@ def main():
         else:
             print(f"  {key}: {value}")
     
-    # Load data
     train_data, test_data = load_cpp_cuda_data(
         args.data_path,
         train_ratio=args.train_ratio,
@@ -845,13 +718,9 @@ def main():
         seed=args.seed
     )
     
-    # Load expert models
     expert_models, tokenizers = load_expert_models(args)
-    
-    # Use first tokenizer for data processing (primary tokenizer)
     tokenizer = tokenizers[0]
     
-    # Create datasets and dataloaders
     train_dataloader, test_dataloader = create_dataloaders(
         train_data, test_data, tokenizer,
         batch_size=args.batch_size,
@@ -859,13 +728,12 @@ def main():
         num_workers=args.num_workers
     )
     
-    # Initialize MoT model
     model = setup_mot_model(expert_models, tokenizers, args)
     
-    # Run evaluation only if specified
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     if args.eval_only:
         if args.checkpoint_path:
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             model = model.to(device)
             load_checkpoint(model, args.checkpoint_path, device)
         
@@ -873,7 +741,6 @@ def main():
         print("Running Evaluation Only")
         print("=" * 60)
         
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model = model.to(device)
         
         results = evaluate(model, test_dataloader, tokenizers, args)
@@ -881,9 +748,7 @@ def main():
         evaluator = CudaCodeEvaluator()
         evaluator.print_results(results)
         
-        # Save results
         results_path = os.path.join(args.output_dir, 'eval_results.json')
-        # Convert any non-serializable items
         save_results = {k: v for k, v in results.items() if isinstance(v, (int, float, str, list, dict))}
         with open(results_path, 'w') as f:
             json.dump(save_results, f, indent=2)
@@ -891,25 +756,74 @@ def main():
         
         return
     
-    # Train
     trained_model = train(model, train_dataloader, test_dataloader, tokenizers, args)
     
-    # Final evaluation
+    # =========================================================================
+    # Final Evaluation 1: Using last epoch weights (already in memory)
+    # =========================================================================
     print("\n" + "=" * 60)
-    print("Final Evaluation")
+    print("Final Evaluation (Last Epoch Weights)")
     print("=" * 60)
     
-    final_results = evaluate(trained_model, test_dataloader, tokenizers, args)
+    last_epoch_results = evaluate(trained_model, test_dataloader, tokenizers, args)
     
     evaluator = CudaCodeEvaluator()
-    evaluator.print_results(final_results)
+    evaluator.print_results(last_epoch_results)
     
-    # Save final results
-    results_path = os.path.join(args.output_dir, 'final_results.json')
-    save_results = {k: v for k, v in final_results.items() if isinstance(v, (int, float, str, list, dict))}
-    with open(results_path, 'w') as f:
+    last_epoch_results_path = os.path.join(args.output_dir, 'final_results_last_epoch.json')
+    save_results = {k: v for k, v in last_epoch_results.items() if isinstance(v, (int, float, str, list, dict))}
+    with open(last_epoch_results_path, 'w') as f:
         json.dump(save_results, f, indent=2)
-    print(f"Final results saved to {results_path}")
+    print(f"Last epoch results saved to {last_epoch_results_path}")
+    
+    # =========================================================================
+    # Final Evaluation 2: Using best model weights (load from file)
+    # =========================================================================
+    best_model_path = os.path.join(args.output_dir, 'best_model.pt')
+    
+    if os.path.exists(best_model_path):
+        print("\n" + "=" * 60)
+        print(f"Final Evaluation (Best Model - based on {args.best_model_metric})")
+        print("=" * 60)
+        
+        # Load best model weights
+        checkpoint = load_checkpoint(trained_model, best_model_path, device)
+        best_step = checkpoint.get('step', 'unknown')
+        best_metric_name = checkpoint.get('best_metric_name', args.best_model_metric)
+        best_metric_value = checkpoint.get('best_metric', 0)
+        print(f"  Loaded best model from step {best_step} ({best_metric_name}: {best_metric_value:.2f})")
+        
+        best_model_results = evaluate(trained_model, test_dataloader, tokenizers, args)
+        
+        evaluator.print_results(best_model_results)
+        
+        best_model_results_path = os.path.join(args.output_dir, 'final_results_best_model.json')
+        save_results = {k: v for k, v in best_model_results.items() if isinstance(v, (int, float, str, list, dict))}
+        save_results['best_model_step'] = best_step
+        save_results['best_model_metric'] = best_metric_name
+        save_results['best_model_metric_value'] = best_metric_value
+        with open(best_model_results_path, 'w') as f:
+            json.dump(save_results, f, indent=2)
+        print(f"Best model results saved to {best_model_results_path}")
+        
+        # =====================================================================
+        # Summary: Compare last epoch vs best model
+        # =====================================================================
+        print("\n" + "=" * 60)
+        print("Summary: Last Epoch vs Best Model")
+        print("=" * 60)
+        print(f"  {'Metric':<20} {'Last Epoch':<15} {'Best Model':<15}")
+        print(f"  {'-'*50}")
+        for metric in ['bleu', 'chrf', 'rouge_l', 'exact_match', 'edit_similarity']:
+            last_val = last_epoch_results.get(metric, 0)
+            best_val = best_model_results.get(metric, 0)
+            diff = best_val - last_val
+            diff_str = f"({'+' if diff >= 0 else ''}{diff:.2f})"
+            print(f"  {metric:<20} {last_val:<15.2f} {best_val:<15.2f} {diff_str}")
+        print("=" * 60)
+    else:
+        print(f"\nWarning: Best model file not found at {best_model_path}")
+        print("Skipping best model evaluation.")
 
 
 if __name__ == '__main__':

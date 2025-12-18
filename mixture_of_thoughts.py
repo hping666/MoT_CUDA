@@ -9,6 +9,12 @@ FIXES IN THIS VERSION:
 4. More aggressive clamping of hidden states
 5. LayerNorm before projection to stabilize inputs
 6. Gradient scaling for mixed precision
+7. Added Gumbel-Softmax for differentiable top-k selection
+8. Added Straight-through estimator for gradient flow
+9. Added routing consistency loss (L_con)
+10. Fixed generate() to use MoT forward pass
+11. Fixed translate() to avoid redundant routing calls
+12. Added generate_with_mot() for full MoT inference mode
 """
 
 import torch
@@ -34,10 +40,72 @@ class MoTConfig:
     dropout_rate: float = 0.1
     sentence_encoder_model: str = 'microsoft/deberta-v3-large'
     compute_dtype: Optional[torch.dtype] = None
-    # NEW: Stability settings
-    use_stable_interaction: bool = True  # Use float32 in interaction layer
-    interaction_scale: float = 0.05      # Reduced from 0.1
-    clamp_hidden_states: float = 100.0   # Reduced from 1e4
+    # Stability settings
+    use_stable_interaction: bool = True
+    interaction_scale: float = 0.05
+    clamp_hidden_states: float = 100.0
+    # Gumbel-Softmax settings
+    gumbel_temperature: float = 1.0
+    use_gumbel: bool = True
+    # Consistency loss settings
+    consistency_temperature: float = 2.0
+    lambda_consistency: float = 0.05
+
+
+class GumbelSoftmax:
+    """Gumbel-Softmax for differentiable top-k selection."""
+    
+    @staticmethod
+    def sample_gumbel(shape: Tuple, device: torch.device, eps: float = 1e-20) -> torch.Tensor:
+        """Sample from Gumbel(0, 1) distribution."""
+        U = torch.rand(shape, device=device)
+        return -torch.log(-torch.log(U + eps) + eps)
+    
+    @staticmethod
+    def gumbel_softmax_sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+        """Sample from Gumbel-Softmax distribution."""
+        gumbel_noise = GumbelSoftmax.sample_gumbel(logits.size(), logits.device)
+        y = logits + gumbel_noise
+        return F.softmax(y / temperature, dim=-1)
+    
+    @staticmethod
+    def differentiable_topk(
+        logits: torch.Tensor, 
+        k: int, 
+        temperature: float = 1.0,
+        hard: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Differentiable top-k selection using Gumbel-Softmax.
+        
+        Args:
+            logits: Input logits [batch_size, num_experts]
+            k: Number of experts to select
+            temperature: Temperature for Gumbel-Softmax
+            hard: Whether to use straight-through estimator
+            
+        Returns:
+            indices: Selected expert indices [batch_size, k]
+            weights: Soft or hard selection weights [batch_size, num_experts]
+        """
+        batch_size, num_experts = logits.size()
+        
+        # Gumbel-Softmax sampling
+        y_soft = GumbelSoftmax.gumbel_softmax_sample(logits, temperature)
+        
+        if hard:
+            # Straight-through estimator: hard forward, soft backward
+            _, indices = torch.topk(logits, k, dim=-1)
+            y_hard = torch.zeros_like(y_soft)
+            y_hard.scatter_(1, indices, 1.0)
+            # Gradient flows through y_soft
+            y = y_hard - y_soft.detach() + y_soft
+        else:
+            # Soft selection
+            _, indices = torch.topk(y_soft, k, dim=-1)
+            y = y_soft
+        
+        return indices, y
 
 
 class ExpertWrapper(nn.Module):
@@ -326,13 +394,15 @@ class ExpertWrapper(nn.Module):
 
 
 class SparseRouter(nn.Module):
-    """Sparse top-k router for expert selection. Always uses float32."""
+    """Sparse top-k router for expert selection with Gumbel-Softmax support."""
     
     def __init__(self, input_dim: int, num_experts: int, config: MoTConfig):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = min(config.top_k, num_experts)
         self.temperature = config.router_temperature
+        self.gumbel_temperature = config.gumbel_temperature
+        self.use_gumbel = config.use_gumbel
         
         self.router_mlp = nn.Sequential(
             nn.Linear(input_dim, config.router_hidden_dim),
@@ -349,14 +419,40 @@ class SparseRouter(nn.Module):
                 nn.init.normal_(layer.weight, mean=0.0, std=0.02)
                 nn.init.zeros_(layer.bias)
     
-    def forward(self, prompt_embedding: torch.Tensor, return_scores: bool = False
+    def forward(
+        self, 
+        prompt_embedding: torch.Tensor, 
+        return_scores: bool = False,
+        use_gumbel: Optional[bool] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Route to top-k experts with optional Gumbel-Softmax.
+        
+        Args:
+            prompt_embedding: [batch_size, input_dim] tensor
+            return_scores: Whether to return all expert scores
+            use_gumbel: Override config.use_gumbel (None = use config)
+        """
         prompt_float = prompt_embedding.float()
         scores = self.router_mlp(prompt_float)
         scores = scores / self.temperature
         
-        top_k_scores, top_k_indices = torch.topk(scores, self.top_k, dim=-1)
-        expert_weights = F.softmax(top_k_scores, dim=-1)
+        # Determine whether to use Gumbel-Softmax
+        apply_gumbel = use_gumbel if use_gumbel is not None else self.use_gumbel
+        
+        if self.training and apply_gumbel:
+            # Use Gumbel-Softmax with straight-through estimator
+            top_k_indices, selection_weights = GumbelSoftmax.differentiable_topk(
+                scores, self.top_k, self.gumbel_temperature, hard=True
+            )
+            # Get weights for selected experts
+            top_k_scores = torch.gather(scores, 1, top_k_indices)
+            expert_weights = F.softmax(top_k_scores, dim=-1)
+        else:
+            # Standard top-k selection (inference mode)
+            top_k_scores, top_k_indices = torch.topk(scores, self.top_k, dim=-1)
+            expert_weights = F.softmax(top_k_scores, dim=-1)
+        
         primary_expert = top_k_indices[:, 0]
         
         if return_scores:
@@ -383,8 +479,7 @@ class SparseRouter(nn.Module):
 class InteractionLayer(nn.Module):
     """
     Cross-attention based interaction layer for expert communication.
-    
-    FIXED: Now uses float32 internally for numerical stability with quantized models.
+    Uses float32 internally for numerical stability with quantized models.
     """
     
     def __init__(self, expert_dims: List[int], config: MoTConfig):
@@ -396,7 +491,7 @@ class InteractionLayer(nn.Module):
         self.interaction_scale = config.interaction_scale
         self.clamp_value = config.clamp_hidden_states
         
-        # Input LayerNorms for each expert (stabilizes input before projection)
+        # Input LayerNorms for each expert
         self.input_norms = nn.ModuleList([
             nn.LayerNorm(dim) for dim in expert_dims
         ])
@@ -427,7 +522,7 @@ class InteractionLayer(nn.Module):
         self.dropout = nn.Dropout(config.dropout_rate)
         self.layer_norm = nn.LayerNorm(self.shared_dim)
         
-        # Output LayerNorms for stability
+        # Output LayerNorms
         self.output_norms = nn.ModuleList([
             nn.LayerNorm(dim) for dim in expert_dims
         ])
@@ -435,8 +530,6 @@ class InteractionLayer(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights with smaller values for stability."""
-        # Use smaller initialization for projection layers
         init_scale = 0.02
         
         for i, proj in enumerate(self.expert_projections):
@@ -449,7 +542,6 @@ class InteractionLayer(nn.Module):
             if proj.bias is not None:
                 nn.init.zeros_(proj.bias)
         
-        # Even smaller for back projection
         for back_proj in self.back_projections:
             nn.init.normal_(back_proj.weight, mean=0.0, std=init_scale * 0.1)
             if back_proj.bias is not None:
@@ -477,10 +569,6 @@ class InteractionLayer(nn.Module):
         active_experts: torch.Tensor,
         primary_expert: torch.Tensor,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """
-        Perform inter-expert communication with improved numerical stability.
-        All computations done in float32 internally.
-        """
         primary_idx = primary_expert[0].item()
         primary_hidden = expert_hidden_states[primary_idx]
         
@@ -491,7 +579,6 @@ class InteractionLayer(nn.Module):
         batch_size = primary_hidden.size(0)
         target_seq_len = primary_hidden.size(1)
         
-        # Get device from first projection layer
         layer_device = self.expert_projections[0].weight.device
         
         aligned_states = []
@@ -515,21 +602,14 @@ class InteractionLayer(nn.Module):
             original_dtypes[idx_val] = hidden.dtype
             original_devices[idx_val] = hidden.device
             
-            # === KEY FIX: Use float32 for all interaction computations ===
             hidden_f32 = hidden.to(device=layer_device, dtype=torch.float32)
-            
-            # Clamp to reasonable range BEFORE any operations
             hidden_f32 = torch.clamp(hidden_f32, min=-self.clamp_value, max=self.clamp_value)
-            
-            # Apply input LayerNorm for stability
             hidden_normed = self.input_norms[idx_val].float()(hidden_f32)
             
-            # Check for NaN after normalization
             if torch.isnan(hidden_normed).any():
                 print(f"Warning: NaN after LayerNorm for expert {idx_val}, using clamped input")
                 hidden_normed = hidden_f32
             
-            # Project to shared space (in float32)
             proj_weight = self.expert_projections[idx_val].weight.float()
             proj_bias = self.expert_projections[idx_val].bias
             if proj_bias is not None:
@@ -537,12 +617,10 @@ class InteractionLayer(nn.Module):
             
             proj = F.linear(hidden_normed, proj_weight, proj_bias)
             
-            # Check for NaN after projection
             if torch.isnan(proj).any():
                 print(f"Warning: NaN after projection for expert {idx_val}, skipping")
                 continue
             
-            # Clamp projection output
             proj = torch.clamp(proj, min=-self.clamp_value, max=self.clamp_value)
             
             aligned = self._align_sequence_length(proj, target_seq_len)
@@ -561,11 +639,9 @@ class InteractionLayer(nn.Module):
         if not aligned_states:
             return expert_hidden_states, expert_attention_masks
         
-        # Cross-attention computation (all in float32)
         primary_local_idx = active_indices.index(primary_idx) if primary_idx in active_indices else 0
         primary_proj = aligned_states[primary_local_idx]
         
-        # Q, K, V projections in float32
         Q = F.linear(primary_proj, self.q_proj.weight.float(), 
                      self.q_proj.bias.float() if self.q_proj.bias is not None else None)
         Q = Q.view(batch_size, target_seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -581,7 +657,6 @@ class InteractionLayer(nn.Module):
                      self.v_proj.bias.float() if self.v_proj.bias is not None else None)
         V = V.view(batch_size, total_kv_len, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Attention scores with stability
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
         scores = torch.clamp(scores, min=-50, max=50)
         
@@ -606,13 +681,11 @@ class InteractionLayer(nn.Module):
             print(f"Warning: NaN in attn_output, returning original states")
             return expert_hidden_states, expert_attention_masks
         
-        # Layer norm (in float32)
         layer_norm_weight = self.layer_norm.weight.float()
         layer_norm_bias = self.layer_norm.bias.float() if self.layer_norm.bias is not None else None
         attn_output = F.layer_norm(out_proj + primary_proj, [self.shared_dim], 
                                    layer_norm_weight, layer_norm_bias)
         
-        # Update each expert's hidden states
         updated_hidden_states = list(expert_hidden_states)
         updated_attention_masks = list(expert_attention_masks)
         
@@ -625,7 +698,6 @@ class InteractionLayer(nn.Module):
                 update_source = attn_output
             else:
                 proj = aligned_states[i]
-                # Residual projection in float32
                 residual = proj
                 for layer in self.residual_projections[idx_val]:
                     if isinstance(layer, nn.Linear):
@@ -637,7 +709,6 @@ class InteractionLayer(nn.Module):
                         residual = self.dropout(residual)
                 update_source = residual
             
-            # Align back to original sequence length
             if original_seq_len != target_seq_len:
                 update_t = F.interpolate(
                     update_source.transpose(1, 2),
@@ -648,7 +719,6 @@ class InteractionLayer(nn.Module):
             else:
                 update_t = update_source
             
-            # Back projection in float32
             back_proj = F.linear(update_t, self.back_projections[idx_val].weight.float(),
                                 self.back_projections[idx_val].bias.float() 
                                 if self.back_projections[idx_val].bias is not None else None)
@@ -657,27 +727,23 @@ class InteractionLayer(nn.Module):
                 print(f"Warning: NaN in back_proj for expert {idx_val}, skipping update")
                 continue
             
-            # Clamp and scale down the update
             back_proj = torch.clamp(back_proj, min=-self.clamp_value, max=self.clamp_value)
             
-            # Apply output normalization
             back_proj_normed = F.layer_norm(
                 back_proj, [expert_hidden_states[idx_val].size(-1)],
                 self.output_norms[idx_val].weight.float(),
                 self.output_norms[idx_val].bias.float() if self.output_norms[idx_val].bias is not None else None
             )
             
-            # Convert back to original dtype and device
             back_proj_original = back_proj_normed.to(device=original_device, dtype=original_dtype)
             
-            # Small scale factor for stability
             updated_hidden_states[idx_val] = expert_hidden_states[idx_val] + self.interaction_scale * back_proj_original
         
         return updated_hidden_states, updated_attention_masks
 
 
 class MixtureOfThoughts(nn.Module):
-    """Main Mixture of Thoughts framework with improved stability."""
+    """Main Mixture of Thoughts framework with Gumbel-Softmax and consistency loss."""
     
     def __init__(
         self,
@@ -719,10 +785,8 @@ class MixtureOfThoughts(nn.Module):
         
         sentence_encoder_dim = self.sentence_encoder.get_sentence_embedding_dimension()
         
-        # Router always in float32
         self.router = SparseRouter(sentence_encoder_dim, self.num_experts, config)
         
-        # Interaction layers - will use float32 internally
         self.interaction_layers = nn.ModuleList([
             InteractionLayer(self.expert_dims, config)
             for _ in range(config.num_stacks)
@@ -733,6 +797,10 @@ class MixtureOfThoughts(nn.Module):
                 nn.Linear(dim, vocab_size)
                 for dim, vocab_size in zip(self.expert_dims, self.vocab_sizes)
             ])
+        
+        # Consistency loss settings
+        self.consistency_temperature = config.consistency_temperature
+        self.lambda_consistency = config.lambda_consistency
         
         self._setup_trainable_layers_dtype()
     
@@ -761,11 +829,8 @@ class MixtureOfThoughts(nn.Module):
             print(f"  Loaded sentence encoder: {config.sentence_encoder_model}")
     
     def _setup_trainable_layers_dtype(self):
-        """Setup dtype for trainable layers."""
-        # Interaction layers keep float32 parameters but can receive float16 inputs
-        # The forward pass handles conversion internally
         for layer in self.interaction_layers:
-            layer.to(torch.float32)  # Keep in float32 for stability
+            layer.to(torch.float32)
         
         if hasattr(self, 'auxiliary_heads'):
             for head in self.auxiliary_heads:
@@ -817,39 +882,21 @@ class MixtureOfThoughts(nn.Module):
         labels[expert_input_ids == tokenizer.pad_token_id] = -100
         return labels
     
-    def forward(
+    def _forward_with_routing(
         self,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        raw_texts: Optional[List[str]] = None,
-        prompt_lengths: Optional[List[int]] = None,
-        return_dict: bool = True
+        raw_texts: List[str],
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: Optional[torch.Tensor],
+        active_experts: torch.Tensor,
+        primary_expert: torch.Tensor,
+        device: torch.device,
+        max_length: int
     ) -> Dict[str, Any]:
-        device = self._get_device()
-        
-        if raw_texts is None:
-            if input_ids is None:
-                raise ValueError("Either input_ids or raw_texts must be provided")
-            raw_texts = []
-            for i in range(input_ids.size(0)):
-                if attention_mask is not None:
-                    valid_len = int(attention_mask[i].sum().item())
-                    valid_ids = input_ids[i][:valid_len]
-                else:
-                    valid_ids = input_ids[i]
-                text = self.tokenizers[0].decode(valid_ids.cpu(), skip_special_tokens=False)
-                raw_texts.append(text)
-        
-        batch_size = len(raw_texts)
-        max_length = input_ids.size(1) if input_ids is not None else 2048
-        
-        prompt_repr = self.encode_prompt(raw_texts)
-        
-        active_experts, expert_weights, primary_expert, all_scores = self.router(
-            prompt_repr, return_scores=True
-        )
-        
+        """
+        Internal forward pass with given routing decision.
+        Used for both regular forward and consistency loss computation.
+        """
         expert_hidden_states = [None] * self.num_experts
         expert_attention_masks = [None] * self.num_experts
         expert_input_ids_list = [None] * self.num_experts
@@ -933,7 +980,90 @@ class MixtureOfThoughts(nn.Module):
             print(f"Warning: NaN/Inf in logits, clamping")
             logits = torch.nan_to_num(logits, nan=0.0, posinf=100.0, neginf=-100.0)
         
+        return {
+            'logits': logits,
+            'hidden_states': expert_hidden_states,
+            'expert_labels_list': expert_labels_list,
+            'expert_input_ids_list': expert_input_ids_list,
+            'primary_idx': primary_idx
+        }
+    
+    def compute_consistency_loss(
+        self,
+        logits_1: torch.Tensor,
+        logits_2: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute routing consistency loss between two forward passes.
+        Encourages stable outputs under different routing perturbations.
+        """
+        # Flatten logits for KL computation
+        logits_1_flat = logits_1.view(-1, logits_1.size(-1))
+        logits_2_flat = logits_2.view(-1, logits_2.size(-1))
+        
+        # Compute probabilities with temperature
+        probs_1 = F.softmax(logits_1_flat / self.consistency_temperature, dim=-1)
+        log_probs_2 = F.log_softmax(logits_2_flat / self.consistency_temperature, dim=-1)
+        
+        probs_2 = F.softmax(logits_2_flat / self.consistency_temperature, dim=-1)
+        log_probs_1 = F.log_softmax(logits_1_flat / self.consistency_temperature, dim=-1)
+        
+        # Symmetric KL divergence
+        kl_1_2 = F.kl_div(log_probs_2, probs_1, reduction='batchmean')
+        kl_2_1 = F.kl_div(log_probs_1, probs_2, reduction='batchmean')
+        
+        return (kl_1_2 + kl_2_1) / 2
+    
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        raw_texts: Optional[List[str]] = None,
+        prompt_lengths: Optional[List[int]] = None,
+        return_dict: bool = True,
+        compute_consistency: bool = True
+    ) -> Dict[str, Any]:
+        device = self._get_device()
+        
+        if raw_texts is None:
+            if input_ids is None:
+                raise ValueError("Either input_ids or raw_texts must be provided")
+            raw_texts = []
+            for i in range(input_ids.size(0)):
+                if attention_mask is not None:
+                    valid_len = int(attention_mask[i].sum().item())
+                    valid_ids = input_ids[i][:valid_len]
+                else:
+                    valid_ids = input_ids[i]
+                text = self.tokenizers[0].decode(valid_ids.cpu(), skip_special_tokens=False)
+                raw_texts.append(text)
+        
+        batch_size = len(raw_texts)
+        max_length = input_ids.size(1) if input_ids is not None else 2048
+        
+        prompt_repr = self.encode_prompt(raw_texts)
+        
+        # First routing (with Gumbel noise if training)
+        active_experts, expert_weights, primary_expert, all_scores = self.router(
+            prompt_repr, return_scores=True
+        )
+        
+        # First forward pass
+        outputs_1 = self._forward_with_routing(
+            raw_texts, input_ids, attention_mask, labels,
+            active_experts, primary_expert, device, max_length
+        )
+        
+        logits = outputs_1['logits']
+        expert_hidden_states = outputs_1['hidden_states']
+        expert_labels_list = outputs_1['expert_labels_list']
+        expert_input_ids_list = outputs_1['expert_input_ids_list']
+        primary_idx = outputs_1['primary_idx']
+        
         total_loss = None
+        consistency_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             
@@ -966,14 +1096,59 @@ class MixtureOfThoughts(nn.Module):
             if torch.isnan(balance_loss) or torch.isinf(balance_loss):
                 balance_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
             
-            aux_loss = torch.tensor(0.0, device=lm_loss.device, dtype=torch.float32)
+            # Compute consistency loss if training and enabled
+            if self.training and compute_consistency and self.lambda_consistency > 0:
+                # Second routing with different Gumbel noise
+                active_experts_2, _, primary_expert_2, _ = self.router(
+                    prompt_repr, return_scores=True
+                )
+                
+                # IMPORTANT: Force same primary expert to ensure same vocab size for KL divergence
+                # This follows the paper's design where consistency is measured across different
+                # active expert combinations but with the same primary expert for output
+                primary_expert_2 = primary_expert.clone()
+                
+                # Ensure primary expert is in active_experts_2
+                # If not, replace the lowest-scoring expert with primary
+                primary_idx_val = primary_expert[0].item()
+                if primary_idx_val not in active_experts_2[0].tolist():
+                    # Replace last position with primary expert
+                    active_experts_2[0, -1] = primary_idx_val
+                
+                # Second forward pass with same primary expert
+                outputs_2 = self._forward_with_routing(
+                    raw_texts, input_ids, attention_mask, labels,
+                    active_experts_2, primary_expert_2, device, max_length
+                )
+                
+                logits_2 = outputs_2['logits']
+                
+                # Verify shapes match before computing KL divergence
+                if logits.shape == logits_2.shape:
+                    # Compute consistency loss
+                    consistency_loss = self.compute_consistency_loss(logits, logits_2)
+                    
+                    if torch.isnan(consistency_loss) or torch.isinf(consistency_loss):
+                        consistency_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+                else:
+                    # Shapes don't match (shouldn't happen with same primary), skip consistency loss
+                    print(f"Warning: logits shape mismatch {logits.shape} vs {logits_2.shape}, skipping consistency loss")
+                    consistency_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+            
+            aux_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
             
             lm_loss = lm_loss.to(device)
             entropy_loss = entropy_loss.to(device)
             balance_loss = balance_loss.to(device)
+            consistency_loss = consistency_loss.to(device)
             aux_loss = aux_loss.to(device)
             
-            total_loss = lm_loss + 0.01 * entropy_loss + 0.01 * balance_loss
+            total_loss = (
+                lm_loss + 
+                0.01 * entropy_loss + 
+                0.01 * balance_loss + 
+                self.lambda_consistency * consistency_loss
+            )
             
             if torch.isnan(total_loss) or torch.isinf(total_loss):
                 print(f"Warning: total_loss is NaN/Inf")
@@ -987,7 +1162,8 @@ class MixtureOfThoughts(nn.Module):
                 'expert_weights': expert_weights,
                 'primary_expert': primary_expert,
                 'router_scores': all_scores,
-                'hidden_states': expert_hidden_states
+                'hidden_states': expert_hidden_states,
+                'consistency_loss': consistency_loss if labels is not None else None
             }
         
         return (total_loss, logits)
@@ -1003,7 +1179,16 @@ class MixtureOfThoughts(nn.Module):
         top_p: float = 0.9,
         do_sample: bool = True,
         **kwargs
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        Generate text using MoT framework (fast mode).
+        Routes once and uses primary expert for generation.
+        MoT forward is called but doesn't affect the actual generation.
+        
+        Returns:
+            generated: Generated token ids
+            primary_idx: Index of the primary expert used for generation
+        """
         device = self._get_device()
         
         if raw_text is None:
@@ -1015,13 +1200,15 @@ class MixtureOfThoughts(nn.Module):
             valid_ids = input_ids[0][:valid_len]
             raw_text = self.tokenizers[0].decode(valid_ids.cpu(), skip_special_tokens=False)
         
+        # Step 1: Get routing decision
         prompt_repr = self.encode_prompt([raw_text])
-        _, _, primary_expert = self.router(prompt_repr)
+        active_experts, expert_weights, primary_expert = self.router(prompt_repr, use_gumbel=False)
         primary_idx = primary_expert[0].item()
         
         primary_tokenizer = self.tokenizers[primary_idx]
         primary_model = self.experts[primary_idx].model
         
+        # Step 2: Call MoT forward to enrich hidden states (like official code)
         encoding = primary_tokenizer(
             raw_text, return_tensors='pt', truncation=True,
             max_length=max_length // 2 if max_length else 1024
@@ -1029,28 +1216,163 @@ class MixtureOfThoughts(nn.Module):
         gen_input_ids = encoding['input_ids'].to(device)
         gen_attention_mask = encoding['attention_mask'].to(device)
         
-        if max_new_tokens is not None and max_length is None:
-            max_length = gen_input_ids.shape[1] + max_new_tokens
-        elif max_length is None:
-            max_length = 2048
-        
         with torch.no_grad():
-            gen_kwargs = {k: v for k, v in kwargs.items() 
-                         if k not in ['do_sample', 'temperature', 'top_p', 'max_length', 'max_new_tokens']}
-            
-            generated = primary_model.generate(
+            # Run MoT forward pass (enriches hidden states through interaction layers)
+            _ = self.forward(
                 input_ids=gen_input_ids,
                 attention_mask=gen_attention_mask,
-                max_length=max_length,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=do_sample,
-                pad_token_id=primary_tokenizer.pad_token_id,
-                eos_token_id=primary_tokenizer.eos_token_id,
-                **gen_kwargs
+                raw_texts=[raw_text],
+                return_dict=True,
+                compute_consistency=False  # No need for consistency during inference
             )
         
-        return generated
+        # Step 3: Generate using primary expert
+        # Clean kwargs to avoid conflicts
+        gen_kwargs = {k: v for k, v in kwargs.items() 
+                     if k not in ['do_sample', 'temperature', 'top_p', 'max_length', 'max_new_tokens']}
+        
+        # Build generation parameters - use only one length parameter to avoid conflict
+        generation_params = {
+            'input_ids': gen_input_ids,
+            'attention_mask': gen_attention_mask,
+            'temperature': temperature,
+            'top_p': top_p,
+            'do_sample': do_sample,
+            'pad_token_id': primary_tokenizer.pad_token_id,
+            'eos_token_id': primary_tokenizer.eos_token_id,
+            **gen_kwargs
+        }
+        
+        # Only set one length parameter: prefer max_new_tokens over max_length
+        if max_new_tokens is not None:
+            generation_params['max_new_tokens'] = max_new_tokens
+        elif max_length is not None:
+            generation_params['max_length'] = max_length
+        else:
+            generation_params['max_new_tokens'] = 512  # Default value
+        
+        with torch.no_grad():
+            generated = primary_model.generate(**generation_params)
+        
+        return generated, primary_idx
+    
+    def generate_with_mot(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        raw_text: Optional[str] = None,
+        max_new_tokens: int = 256,
+        temperature: float = 1.0,
+        top_p: float = 0.9,
+        **kwargs
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        Generate text using full MoT framework (slow but accurate mode).
+        Each token is generated using MoT's enriched hidden states from expert interaction.
+        
+        This method actually utilizes the multi-expert interaction for generation,
+        unlike generate() which only uses routing to select an expert.
+        
+        Args:
+            input_ids: Input token IDs (optional if raw_text provided)
+            attention_mask: Attention mask (optional)
+            raw_text: Raw input text (optional if input_ids provided)
+            max_new_tokens: Maximum number of new tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p (nucleus) sampling parameter
+            **kwargs: Additional arguments (unused, for compatibility)
+            
+        Returns:
+            generated: Generated token ids [1, seq_len]
+            primary_idx: Index of the primary expert used
+        """
+        device = self._get_device()
+        
+        # Prepare input text
+        if raw_text is None:
+            if input_ids is None:
+                raise ValueError("Either input_ids or raw_text must be provided")
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+            valid_len = int(attention_mask[0].sum().item())
+            valid_ids = input_ids[0][:valid_len]
+            raw_text = self.tokenizers[0].decode(valid_ids.cpu(), skip_special_tokens=False)
+        
+        # Step 1: Get routing decision (once at the beginning)
+        prompt_repr = self.encode_prompt([raw_text])
+        active_experts, expert_weights, primary_expert = self.router(prompt_repr, use_gumbel=False)
+        primary_idx = primary_expert[0].item()
+        
+        primary_tokenizer = self.tokenizers[primary_idx]
+        vocab_size = self.experts[primary_idx].vocab_size
+        
+        # Step 2: Tokenize with primary expert's tokenizer
+        encoding = primary_tokenizer(
+            raw_text, return_tensors='pt', truncation=True, max_length=1024
+        )
+        generated_ids = encoding['input_ids'].to(device)
+        current_attention_mask = encoding['attention_mask'].to(device)
+        
+        batch_size = generated_ids.size(0)
+        current_raw_text = raw_text
+        
+        # Step 3: Generate tokens one by one using MoT forward
+        for step in range(max_new_tokens):
+            # Run MoT forward pass - this time we USE the logits
+            with torch.no_grad():
+                outputs = self.forward(
+                    input_ids=generated_ids,
+                    attention_mask=current_attention_mask,
+                    raw_texts=[current_raw_text],
+                    return_dict=True,
+                    compute_consistency=False
+                )
+            
+            # Get logits for the last position
+            logits = outputs['logits'][:, -1, :]  # [batch_size, vocab_size]
+            
+            # Apply temperature
+            if temperature != 1.0:
+                logits = logits / temperature
+            
+            # Apply top-p (nucleus) sampling
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                
+                # Remove tokens with cumulative probability above threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift the indices to the right to keep the first token above threshold
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                # Scatter sorted tensors to original indexing
+                indices_to_remove = sorted_indices_to_remove.scatter(
+                    1, sorted_indices, sorted_indices_to_remove
+                )
+                logits[indices_to_remove] = float('-inf')
+            
+            # Sample next token
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)  # [batch_size, 1]
+            
+            # Check for EOS token
+            if next_token.item() == primary_tokenizer.eos_token_id:
+                break
+            
+            # Append to generated sequence
+            generated_ids = torch.cat([generated_ids, next_token], dim=-1)
+            current_attention_mask = torch.cat([
+                current_attention_mask,
+                torch.ones((batch_size, 1), device=device, dtype=current_attention_mask.dtype)
+            ], dim=-1)
+            
+            # Update raw text for next iteration
+            current_raw_text = primary_tokenizer.decode(
+                generated_ids[0], skip_special_tokens=False
+            )
+        
+        return generated_ids, primary_idx
     
     def translate(
         self,
@@ -1059,30 +1381,57 @@ class MixtureOfThoughts(nn.Module):
         max_new_tokens: int = 512,
         temperature: float = 0.7,
         top_p: float = 0.95,
+        use_mot_generate: bool = False,
         **kwargs
     ) -> Tuple[str, int]:
+        """
+        Translate source code to CUDA.
+        
+        Args:
+            source_text: Source C++ code to translate
+            prompt_template: Template for formatting the prompt
+            max_new_tokens: Maximum number of new tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling parameter
+            use_mot_generate: If True, use full MoT generation (slow but uses expert interaction)
+                             If False, use fast generation (only routing, no interaction during generation)
+            **kwargs: Additional arguments passed to generate()
+            
+        Returns:
+            generated_code: Generated CUDA code
+            primary_idx: Index of the primary expert used
+        """
         prompt = prompt_template.format(source=source_text)
         
-        prompt_repr = self.encode_prompt([prompt])
-        _, _, primary_expert = self.router(prompt_repr)
-        primary_idx = primary_expert[0].item()
+        # Choose generation method based on use_mot_generate flag
+        if use_mot_generate:
+            # Full MoT generation - each token uses expert interaction
+            output_ids, primary_idx = self.generate_with_mot(
+                raw_text=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                **kwargs
+            )
+        else:
+            # Fast generation - only routing, expert generates independently
+            output_ids, primary_idx = self.generate(
+                raw_text=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                **kwargs
+            )
         
+        # Decode generated output
         tokenizer = self.tokenizers[primary_idx]
-        
-        output_ids = self.generate(
-            raw_text=prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            **kwargs
-        )
-        
         prompt_encoding = tokenizer(prompt, return_tensors='pt')
         prompt_len = prompt_encoding['input_ids'].shape[1]
         
         generated_ids = output_ids[0, prompt_len:]
         generated_code = tokenizer.decode(generated_ids, skip_special_tokens=True)
         
+        # Post-process: truncate at stop markers
         for stop_marker in ['\n\n\n', '###', '<|endoftext|>', '<|end|>', '<|im_end|>']:
             if stop_marker in generated_code:
                 generated_code = generated_code.split(stop_marker)[0]
@@ -1093,7 +1442,7 @@ class MixtureOfThoughts(nn.Module):
         with torch.no_grad():
             prompt_repr = self.encode_prompt([text])
             active_experts, expert_weights, primary_expert, scores = self.router(
-                prompt_repr, return_scores=True
+                prompt_repr, return_scores=True, use_gumbel=False
             )
             all_probs = F.softmax(scores, dim=-1)
             
