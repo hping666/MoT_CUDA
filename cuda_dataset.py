@@ -322,7 +322,7 @@ def create_dataloaders(
     batch_size: int = 1,
     max_length: int = 1024,
     num_workers: int = 0
-) -> Tuple[DataLoader, DataLoader]:
+) -> Tuple[Optional[DataLoader], Optional[DataLoader]]:
     """
     Create DataLoaders for training and testing.
     
@@ -330,49 +330,56 @@ def create_dataloaders(
         train_data: Training data list
         test_data: Test data list
         tokenizer: Tokenizer to use
-        batch_size: Batch size
+        batch_size: Batch size to use for both loaders
         max_length: Maximum sequence length
         num_workers: Number of worker processes
         
     Returns:
-        Tuple of (train_dataloader, test_dataloader)
+        Tuple of (train_dataloader, test_dataloader). 
+        Returns None for loaders where the input data list is empty or None.
     """
-    # Create datasets
-    train_dataset = CppCudaDataset(
-        data=train_data,
-        tokenizer=tokenizer,
-        max_length=max_length,
-        is_train=True
+    # Create data collator using provided parameters
+    collator = DataCollatorForCppCuda(
+        tokenizer=tokenizer, 
+        padding=True, 
+        max_length=max_length
     )
     
-    test_dataset = CppCudaDataset(
-        data=test_data,
-        tokenizer=tokenizer,
-        max_length=max_length,
-        is_train=False  # For evaluation, we generate and compare
-    )
+    train_dataloader = None
+    # Check if train_data exists and is not empty to avoid DataLoader initialization error
+    if train_data and len(train_data) > 0:
+        train_dataset = CppCudaDataset(
+            data=train_data,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            is_train=True
+        )
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=collator,
+            num_workers=num_workers,
+            pin_memory=True
+        )
     
-    # Create data collator
-    collator = DataCollatorForCppCuda(tokenizer, padding=True, max_length=max_length)
-    
-    # Create dataloaders
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collator,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-    
-    test_dataloader = DataLoader(
-        test_dataset,
-        batch_size=1,  # Generate one at a time for evaluation
-        shuffle=False,
-        collate_fn=collator,
-        num_workers=num_workers,
-        pin_memory=True
-    )
+    test_dataloader = None
+    # Check if test_data exists and is not empty
+    if test_data and len(test_data) > 0:
+        test_dataset = CppCudaDataset(
+            data=test_data,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            is_train=False
+        )
+        test_dataloader = DataLoader(
+            test_dataset,
+            batch_size=batch_size, # Using passed batch_size instead of hardcoded 1
+            shuffle=False,
+            collate_fn=collator,
+            num_workers=num_workers,
+            pin_memory=True
+        )
     
     return train_dataloader, test_dataloader
 
