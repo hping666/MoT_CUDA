@@ -1,71 +1,25 @@
-# Mixture of Thoughts (MoT) for CUDA Code Generation
+# Mixture of Thoughts (MoT)
 
-A framework for orchestrating multiple Large Language Models (LLMs) using sparse top-k routing, specialized for **C++ to CUDA code translation**. MoT dynamically selects and combines outputs from multiple expert code models based on input characteristics.
+A framework for orchestrating multiple Large Language Models (LLMs) using sparse top-k routing. MoT dynamically selects and combines outputs from multiple expert models based on input characteristics, enabling efficient and specialized model deployment.
 
 ## Overview
 
-This implementation applies the Mixture of Thoughts framework to the task of translating C++ code into CUDA kernels. The system uses three specialized code generation models as experts:
-
-- **Qwen2.5-Coder**: Strong general code generation capabilities
-- **HPC-Coder-v2**: Specialized for HPC and parallel code patterns  
-- **StarCoder2**: Multi-language code generation with broad coverage
-
-A learned router dynamically selects the most appropriate experts for each input, combining their outputs through cross-attention interaction layers and stack-based layer partitioning.
+The Mixture of Thoughts framework implements a multi-expert system where different language models act as specialized experts. A learned router dynamically selects the most appropriate experts for each input, combining their outputs through attention mechanisms and stack-based layer partitioning.
 
 ### Key Features
 
-- **Sparse Top-K Routing**: Gumbel-Softmax based differentiable expert selection
+- We use Sparse Top-K Routing. You can plug and play any router as you please.
 - **Stack-Based Layer Partitioning**: Divides model layers into stacks for fine-grained expert interaction
-- **Cross-Expert Attention**: Enables information flow between selected experts at each stack
-- **Routing Consistency Loss**: Encourages stable outputs under different routing perturbations
-- **4-bit/8-bit Quantization**: Memory-efficient expert model loading via bitsandbytes
-- **Comprehensive Evaluation**: BLEU, chrF, ROUGE-L, Exact Match, Edit Similarity, and Syntax Validity metrics
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    MixtureOfThoughts Framework                  │
-├─────────────────────────────────────────────────────────────────┤
-│  Input: C++ Source Code                                         │
-│       ↓                                                         │
-│  ┌──────────────────┐                                          │
-│  │ Sentence Encoder │  (DeBERTa-v3-large)                      │
-│  │  Prompt → Vector │                                          │
-│  └────────┬─────────┘                                          │
-│           ↓                                                     │
-│  ┌──────────────────┐                                          │
-│  │  Sparse Router   │  Gumbel-Softmax + Top-K Selection        │
-│  │  (Trainable MLP) │                                          │
-│  └────────┬─────────┘                                          │
-│           ↓                                                     │
-│  ┌──────────────────────────────────────────┐                  │
-│  │         Expert Models (Frozen)           │                  │
-│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐   │                  │
-│  │  │  Qwen   │ │   HPC   │ │  Star   │   │                  │
-│  │  │  Coder  │ │  Coder  │ │ Coder2  │   │                  │
-│  │  └────┬────┘ └────┬────┘ └────┬────┘   │                  │
-│  └───────┼───────────┼───────────┼────────┘                  │
-│          ↓           ↓           ↓                             │
-│  ┌──────────────────────────────────────────┐                  │
-│  │      Interaction Layers (Trainable)      │                  │
-│  │   Stack 1 → Stack 2 → ... → Stack N      │                  │
-│  │   (Cross-Expert Attention Mechanism)     │                  │
-│  └──────────────────────────────────────────┘                  │
-│          ↓                                                     │
-│  ┌──────────────────┐                                          │
-│  │  Primary Expert  │                                          │
-│  │    LM Head       │  → Output: CUDA Kernel Code              │
-│  └──────────────────┘                                          │
-└─────────────────────────────────────────────────────────────────┘
-```
+- **Cross-Expert Attention**: Enables information flow between selected experts
+- **Distributed Training**: Supports multi-GPU training with DDP (Distributed Data Parallel)
+- **Multiple Benchmark Support**: Compatible with MMLU, GSM8K, CMMLU, ARC-Challenge, HumanEval, and ParEval datasets
 
 ## Installation
 
 ### Requirements
 
 - Python 3.8 or higher
-- CUDA-capable GPU with at least 16GB VRAM (24GB+ recommended)
+- CUDA-capable GPU (recommended)
 - PyTorch 2.0.0 or higher
 
 ### Setup
@@ -73,7 +27,7 @@ A learned router dynamically selects the most appropriate experts for each input
 1. Clone the repository:
 ```bash
 git clone <repository-url>
-cd mot-cuda
+cd mot
 ```
 
 2. Install dependencies:
@@ -81,406 +35,249 @@ cd mot-cuda
 pip install -r requirements.txt
 ```
 
-Required packages:
-```
-torch>=2.0.0
-transformers>=4.35.0
-sentence-transformers>=2.2.0
-bitsandbytes>=0.41.0
-accelerate>=0.24.0
-tqdm
-numpy
+3. Download expert models (optional, will download automatically during first use):
+```bash
+python download_experts.py --config configs/routerdc_mot_config.json
 ```
 
 ## Project Structure
 
 ```
-mot-cuda/
+mot/
 ├── mixture_of_thoughts.py    # Core MoT framework implementation
-├── train_cuda_mot.py         # Training script for C++ to CUDA translation
-├── evaluate.py               # Standalone evaluation script
-├── cuda_dataset.py           # Dataset loading and preprocessing
-├── cuda_evaluation.py        # Evaluation metrics (BLEU, chrF, etc.)
-├── utils.py                  # Helper functions and model loading utilities
-├── cpp_cuda_train_synthetic.jsonl  # Training data (JSONL format)
-└── cuda_mot_output/          # Output directory for checkpoints and results
+├── training.py               # Training utilities and loss functions
+├── train_ddp.py             # Distributed training script
+├── dataset_loaders.py       # Dataset loading utilities
+├── utils.py                 # Helper functions and utilities
+├── example.py               # Usage examples
+├── configs/                 # Configuration files
+│   └── routerdc_mot_config.json
+├── experiments/             # Experiment results and checkpoints
+├── logs/                    # Training logs
+├── pareval/                 # ParEval benchmark integration
+│   ├── generate_pareval.py  # Code generation script
+│   ├── evaluate_pareval.py  # Evaluation script
+│   ├── drivers/             # ParEval test drivers
+│   └── README.md            # Detailed ParEval documentation
+└── requirements.txt         # Package dependencies
 ```
-
-## Data Format
-
-The training data should be in JSONL format with the following structure:
-
-```json
-{"cpp": "void add(int* a, int* b, int n) { for(int i=0; i<n; i++) a[i] += b[i]; }", "generated_cuda": "__global__ void add(int* a, int* b, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if(i < n) a[i] += b[i]; }"}
-```
-
-Each line contains:
-- `cpp`: The source C++ code to translate
-- `generated_cuda`: The target CUDA kernel code
 
 ## Usage
 
-### Quick Start - Training
+### Quick Start
 
+Run a simple inference example:
 ```bash
-python train_cuda_mot.py \
-    --data_path ./cpp_cuda_train_synthetic.jsonl \
-    --use_4bit \
-    --num_epochs 3 \
-    --output_dir ./cuda_mot_output
+python example.py --demo inference
 ```
 
-### Quick Start - Evaluation
+### Training
 
+#### Single GPU Training
 ```bash
-python evaluate.py \
-    --checkpoint_path ./cuda_mot_output/best_model.pt \
-    --data_path ./cpp_cuda_train_synthetic.jsonl \
-    --use_4bit
+python train_ddp.py --config configs/routerdc_mot_config.json
 ```
 
-### Training Configuration
-
-Key training parameters:
-
+#### Multi-GPU Training
 ```bash
-python train_cuda_mot.py \
-    --data_path ./cpp_cuda_train_synthetic.jsonl \
-    --train_ratio 0.8 \
-    --test_ratio 0.1 \
-    --batch_size 1 \
-    --gradient_accumulation_steps 8 \
-    --num_epochs 3 \
-    --learning_rate 5e-6 \
-    --max_length 512 \
-    --max_new_tokens 256 \
-    --num_stacks 4 \
-    --top_k 2 \
-    --lambda_consistency 0.05 \
-    --best_model_metric bleu \
-    --use_4bit \
-    --single_gpu \
-    --output_dir ./cuda_mot_output
+./run_experiments.sh --gpus 0,1,2,3 --exp-name mot_experiment
 ```
 
-### Evaluation Configuration
-
+Or using torchrun directly:
 ```bash
-python evaluate.py \
-    --checkpoint_path ./cuda_mot_output/best_model.pt \
-    --data_path ./cpp_cuda_train_synthetic.jsonl \
-    --test_ratio 0.1 \
-    --seed 42 \
-    --max_new_tokens 256 \
-    --use_4bit \
-    --single_gpu \
-    --output_dir ./eval_output \
-    --save_predictions
+torchrun --nproc_per_node=4 train_ddp.py --config configs/routerdc_mot_config.json
 ```
 
-## Core Parameters
+### Configuration
 
-### MoT Architecture Parameters
+The framework is configured through JSON files. Key configuration parameters include:
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `num_stacks` | 4 | Number of layer stacks to partition each expert model into |
-| `top_k` | 2 | Number of experts to activate for each input |
-| `shared_dim` | min(expert_dims) | Shared dimension for cross-expert interaction |
-| `router_hidden_dim` | 512 | Hidden dimension of the router MLP |
-| `interaction_heads` | 8 | Number of attention heads in interaction layers |
-
-### Training Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `learning_rate` | 5e-6 | Base learning rate (router uses 2x, auxiliary uses 0.5x) |
-| `batch_size` | 1 | Training batch size per step |
-| `gradient_accumulation_steps` | 8 | Steps to accumulate before optimizer update |
-| `gradient_clip` | 0.3 | Maximum gradient norm for clipping |
-| `lambda_consistency` | 0.05 | Weight for routing consistency loss |
-| `warmup_steps` | 200 | Number of warmup steps for scheduler |
-
-### Quantization Options
-
-| Parameter | Description |
-|-----------|-------------|
-| `--use_4bit` | Load expert models in 4-bit quantization (recommended) |
-| `--use_8bit` | Load expert models in 8-bit quantization |
-| `--single_gpu` | Load all models on single GPU (required for layer-by-layer forward) |
-
-### Best Model Selection
-
-| Metric | Description |
-|--------|-------------|
-| `bleu` | BLEU-4 score (default) |
-| `chrf` | Character-level F-score |
-| `rouge_l` | ROUGE-L F1 score |
-| `exact_match` | Exact match percentage |
-| `edit_similarity` | Edit distance similarity |
-
-## Loss Function
-
-The total training loss combines multiple components:
-
-```
-L_total = L_lm + 0.01 * L_entropy + 0.01 * L_balance + λ * L_consistency
+```json
+{
+  "experiment_name": "mot_experiment",
+  "expert_models": [
+    "model_name_1",
+    "model_name_2"
+  ],
+  "mot_config": {
+    "num_stacks": 4,
+    "top_k": 3,
+    "shared_dim": 768,
+    "router_hidden_dim": 256,
+    "interaction_heads": 8
+  },
+  "training": {
+    "batch_size": 8,
+    "learning_rate": 1e-4,
+    "num_epochs": 10,
+    "gradient_accumulation_steps": 4
+  }
+}
 ```
 
-| Component | Description |
-|-----------|-------------|
-| `L_lm` | Language modeling cross-entropy loss (only on CUDA output tokens) |
-| `L_entropy` | Router entropy regularization (encourages exploration) |
-| `L_balance` | Load balancing loss (prevents expert collapse) |
-| `L_consistency` | Routing consistency loss (symmetric KL divergence between two forward passes with different Gumbel noise) |
+### Example Code
 
-## Generation Modes
-
-### Fast Mode (Default)
-```bash
-python evaluate.py --checkpoint_path ./best_model.pt
-```
-- Routes once at the beginning
-- Primary expert generates independently using `model.generate()`
-- Much faster inference
-- Best for production use
-
-### Full MoT Mode
-```bash
-python evaluate.py --checkpoint_path ./best_model.pt --use_mot_generate
-```
-- Each token generated through full MoT forward pass
-- Expert interaction at every step
-- Slower but potentially higher quality
-- Best for research and comparison
-
-## Evaluation Metrics
-
-The framework computes comprehensive code generation metrics:
-
-| Metric | Range | Description |
-|--------|-------|-------------|
-| **BLEU-4** | 0-100 | N-gram precision with brevity penalty |
-| **chrF** | 0-100 | Character-level F-score |
-| **ROUGE-L** | 0-100 | Longest common subsequence F1 |
-| **Exact Match** | 0-100% | Percentage of exact matches |
-| **Edit Similarity** | 0-100% | 1 - normalized Levenshtein distance |
-| **Syntax Validity** | 0-100% | CUDA syntax validity check |
-
-## Example Code
-
-### Basic Usage
+Basic usage example:
 
 ```python
 from mixture_of_thoughts import MixtureOfThoughts, MoTConfig
-from utils import ExpertConfig, ExpertLoader
-import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Define expert configurations
-expert_configs = [
-    ExpertConfig(
-        model_name='Qwen/Qwen2.5-Coder-1.5B',
-        model_type='causal_lm',
-        load_in_4bit=True,
-        single_gpu=True,
-        target_device='cuda:0'
-    ),
-    ExpertConfig(
-        model_name='hpcgroup/hpc-coder-v2-1.3b',
-        model_type='causal_lm',
-        load_in_4bit=True,
-        single_gpu=True,
-        target_device='cuda:0'
-    ),
-    ExpertConfig(
-        model_name='bigcode/starcoder2-3b',
-        model_type='causal_lm',
-        load_in_4bit=True,
-        single_gpu=True,
-        target_device='cuda:0'
-    ),
+# Load expert models
+expert_models = [
+    AutoModelForCausalLM.from_pretrained("gpt2"),
+    AutoModelForCausalLM.from_pretrained("distilgpt2")
 ]
-
-# Load experts
-models, tokenizers = ExpertLoader.load_multiple_experts(expert_configs)
+tokenizers = [
+    AutoTokenizer.from_pretrained("gpt2"),
+    AutoTokenizer.from_pretrained("distilgpt2")
+]
 
 # Configure MoT
 config = MoTConfig(
     num_stacks=4,
     top_k=2,
-    shared_dim=min(m.config.hidden_size for m in models),
-    lambda_consistency=0.05
+    shared_dim=768
 )
 
 # Initialize framework
 mot_model = MixtureOfThoughts(
-    expert_models=models,
+    expert_models=expert_models,
     tokenizers=tokenizers,
     config=config
 )
-mot_model = mot_model.to('cuda')
 
-# Translate C++ to CUDA
-cpp_code = """
-void vectorAdd(float* a, float* b, float* c, int n) {
-    for (int i = 0; i < n; i++) {
-        c[i] = a[i] + b[i];
-    }
-}
-"""
-
-cuda_code, expert_idx = mot_model.translate(
-    source_text=cpp_code,
-    prompt_template="### Translate C++ to CUDA:\n{source}\n### CUDA:\n",
-    max_new_tokens=256,
-    temperature=0.7,
-    top_p=0.95
-)
-
-print(f"Generated by expert {expert_idx}:")
-print(cuda_code)
+# Run inference
+input_ids = tokenizers[0]("Hello, world!", return_tensors="pt").input_ids
+outputs = mot_model(input_ids=input_ids)
 ```
 
-### Getting Routing Information
+## Supported Datasets
 
-```python
-# Analyze how the router scores different experts
-routing_info = mot_model.get_routing_info(cpp_code)
-print(f"Primary expert: {routing_info['primary_expert']}")
-print(f"Active experts: {routing_info['active_experts']}")
-print(f"Expert probabilities: {routing_info['all_expert_probs']}")
+The framework includes loaders for the following benchmark datasets:
+
+- **MMLU**: Massive Multitask Language Understanding
+- **GSM8K**: Grade School Math 8K
+- **CMMLU**: Chinese Massive Multitask Language Understanding
+- **ARC-Challenge**: AI2 Reasoning Challenge
+- **HumanEval**: Code generation benchmark
+- **ParEval**: Parallel code generation benchmark (see below)
+
+## ParEval Benchmark Evaluation
+
+The MoT framework includes integration with [ParEval](https://github.com/parallelcodefoundry/ParEval), a benchmark for evaluating parallel code generation capabilities across multiple parallelism models (CUDA, OpenMP, MPI, etc.).
+
+### Quick Start
+
+```bash
+cd mot/pareval
+
+# 1. Generate code samples (C++ to CUDA translation)
+python generate_pareval.py \
+    --prompts ~/ParEval/prompts/translation-prompts.json \
+    --task translation \
+    --output ./outputs/mot_translation.json \
+    --num_samples 50
+
+# 2. Evaluate generated code (compile, run, compute pass@k)
+python evaluate_pareval.py --input ./outputs/mot_translation.json
 ```
 
-## Output Structure
+### Features
 
-After training, the output directory contains:
+- **Code Generation**: Generate parallel code samples using trained MoT models
+- **Automated Evaluation**: Compile and test generated code against ParEval test cases
+- **Metrics Computation**: Calculate pass@k, build@k, and other standard metrics
+- **Multiple Tasks**: Supports both translation (C++ → CUDA) and direct generation tasks
 
-```
-cuda_mot_output/
-├── args.json                      # Training configuration
-├── best_model.pt                  # Best checkpoint (by selected metric)
-├── checkpoint-{step}.pt           # Periodic checkpoints
-├── final_results_last_epoch.json  # Evaluation with last epoch weights
-└── final_results_best_model.json  # Evaluation with best model weights
-```
+For detailed usage, configuration options, and troubleshooting, see [`pareval/README.md`](pareval/README.md).
 
-Checkpoint contents:
-```python
-{
-    'step': int,
-    'epoch': int,
-    'model_state_dict': dict,      # Router + Interaction layers only
-    'optimizer_state_dict': dict,
-    'scheduler_state_dict': dict,
-    'best_metric': float,
-    'best_metric_name': str,
-    'args': dict
-}
+## Training Scripts
+
+### Distributed Training
+```bash
+./run_experiments.sh [OPTIONS]
+
+Options:
+  -g, --gpus          GPU IDs to use (e.g., '0,1,2,3')
+  -n, --num-gpus      Number of GPUs to use
+  -c, --config        Path to configuration file
+  -e, --exp-name      Experiment name for logging
+  -w, --wandb-mode    WandB mode: online, offline, disabled
+  -r, --resume        Path to checkpoint to resume from
 ```
 
-## Changing Expert Models
-
-To use different expert models, modify the `EXPERT_MODELS` list in `train_cuda_mot.py`:
-
-```python
-# For larger models (requires more VRAM)
-EXPERT_MODELS = [
-    {
-        'name': 'Qwen/Qwen2.5-Coder-7B',
-        'description': 'Qwen2.5 Coder 7B - Strong general code generation',
-    },
-    {
-        'name': 'hpcgroup/hpc-coder-v2-6.7b',
-        'description': 'HPC-Coder-v2 - Specialized for HPC/parallel code',
-    },
-    {
-        'name': 'bigcode/starcoder2-7b',
-        'description': 'StarCoder2 7B - Multi-language code generation',
-    },
-]
+### Model Downloading
+```bash
+python download_experts.py --config configs/routerdc_mot_config.json --max-workers 4
 ```
+
+## Architecture
+
+The MoT framework consists of several key components:
+
+1. **Router Network**: A learnable MLP that assigns scores to each expert based on input embeddings
+2. **Expert Models**: Pre-trained language models that serve as specialized experts
+3. **Stack Partitioning**: Divides each expert into Q stacks of layers
+4. **Interaction Layers**: Cross-attention mechanisms between selected experts
+5. **Output Aggregation**: Combines expert outputs using learned weights
+
+### Loss Functions
+
+The framework uses multiple loss components:
+- Primary task loss (e.g., language modeling)
+- Router entropy regularization
+- Load balancing loss for expert utilization
+- Auxiliary expert-specific losses
 
 ## Performance Considerations
 
-- **Memory**: 4-bit quantization reduces VRAM usage by ~4x
-- **Speed**: Use fast generation mode for inference (default)
-- **Batch Size**: Keep at 1 with gradient accumulation for stability
-- **Gradient Clipping**: Essential for training stability with quantized models
+- Models are cached in `~/.cache/huggingface/hub` by default
+- Supports 8-bit quantization for memory efficiency
+- Implements gradient checkpointing for large models
+- Uses mixed precision training (fp16/bf16) when available
 
-### Recommended Hardware
+## Logging and Monitoring
 
-| Configuration | Minimum VRAM | Recommended |
-|--------------|--------------|-------------|
-| 1.5B experts (4-bit) | 12GB | 16GB |
-| 3B experts (4-bit) | 16GB | 24GB |
-| 7B experts (4-bit) | 24GB | 48GB |
+- Training logs are saved to `logs/` directory
+- Experiment results and checkpoints stored in `experiments/`
+- Supports Weights & Biases (wandb) integration for experiment tracking
+- Real-time training metrics displayed during training
 
-## Troubleshooting
+## Development
 
-### Common Issues
-
-1. **Out of Memory**
-   - Reduce `max_length` (e.g., 256 instead of 512)
-   - Ensure `--use_4bit` is enabled
-   - Reduce `gradient_accumulation_steps`
-
-2. **NaN Loss**
-   - Check if `gradient_clip` is set (default: 0.3)
-   - Reduce learning rate
-   - The code includes automatic NaN detection and skipping
-
-3. **Slow Training**
-   - Ensure `--single_gpu` is set
-   - Use smaller expert models for experimentation
-   - Disable `--use_mot_generate` during evaluation
-
-4. **Model Download Failures**
-   - Check HuggingFace hub access
-   - Models are cached in `~/.cache/huggingface/hub`
-
-### Debug Mode
-
-Enable detailed logging:
-```python
-import logging
-logging.basicConfig(level=logging.DEBUG)
+### Running Tests
+```bash
+pytest tests/
 ```
 
-Check GPU memory:
-```python
-from utils import print_gpu_memory
-print_gpu_memory()
+### Code Formatting
+```bash
+black .
+isort .
+flake8 .
 ```
-
-## Technical Details
-
-### Numerical Stability
-
-The framework implements several stability measures:
-- InteractionLayer uses float32 internally
-- Hidden states clamped to [-100, 100]
-- LayerNorm applied before and after projections
-- Automatic NaN/Inf detection and replacement
-- Gradient clipping with configurable threshold
-
-### Differentiable Routing
-
-- **Gumbel-Softmax**: Enables gradient flow through discrete expert selection
-- **Straight-Through Estimator**: Hard selection forward, soft gradients backward
-- **Consistency Loss**: Symmetric KL divergence encourages stable routing
-
-### What Gets Trained
-
-Only these components have `requires_grad=True`:
-- Router MLP (~1M parameters)
-- Interaction Layers (~10M parameters per stack)
-- Sentence Encoder (if not frozen)
-
-Expert models are completely frozen to preserve their pre-trained capabilities.
-
 
 ## License
 
 This project is licensed under the MIT License. See LICENSE file for details.
 
+## Troubleshooting
 
+### Common Issues
+
+1. **Out of Memory**: Reduce batch size or enable gradient checkpointing
+2. **Model Download Failures**: Check network connection and HuggingFace hub access
+3. **DDP Training Issues**: Ensure all GPUs are visible and NCCL is properly installed
+
+### Debug Mode
+
+Enable debug logging:
+```python
+import logging
+logging.basicConfig(level=logging.DEBUG)
+```
+
+## Contact
+
+For questions or issues, please open an issue on the repository.
