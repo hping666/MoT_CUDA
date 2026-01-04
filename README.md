@@ -278,6 +278,4 @@ import logging
 logging.basicConfig(level=logging.DEBUG)
 ```
 
-## Contact
 
-For questions or issues, please open an issue on the repository.
