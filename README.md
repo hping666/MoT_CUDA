@@ -54,9 +54,6 @@ mot/
 ├── cuda_evaluation.py       # CUDA code evaluation metrics
 ├── dataset_loaders.py       # General dataset loading utilities
 ├── utils.py                 # Helper functions and utilities
-├── example.py               # Usage examples
-├── configs/                 # Configuration files
-│   └── routerdc_mot_config.json
 ├── experiments/             # Experiment results and checkpoints
 ├── logs/                    # Training logs
 ├── BabelTower/              # BabelTower dataset
