@@ -164,11 +164,6 @@ outputs = mot_model(input_ids=input_ids)
 
 The framework includes loaders for the following benchmark datasets:
 
-- **MMLU**: Massive Multitask Language Understanding
-- **GSM8K**: Grade School Math 8K
-- **CMMLU**: Chinese Massive Multitask Language Understanding
-- **ARC-Challenge**: AI2 Reasoning Challenge
-- **HumanEval**: Code generation benchmark
 - **ParEval**: Parallel code generation benchmark (see below)
 - **BabelTower**: C-to-CUDA auto-parallelized program translation benchmark (see below)
 
