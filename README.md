@@ -12,7 +12,7 @@ The Mixture of Thoughts framework implements a multi-expert system where differe
 - **Stack-Based Layer Partitioning**: Divides model layers into stacks for fine-grained expert interaction
 - **Cross-Expert Attention**: Enables information flow between selected experts
 - **Distributed Training**: Supports multi-GPU training with DDP (Distributed Data Parallel)
-- **Multiple Benchmark Support**: Compatible with MMLU, GSM8K, CMMLU, ARC-Challenge, HumanEval, and ParEval datasets
+- **Multiple Benchmark Support**: Compatible with MMLU, GSM8K, CMMLU, ARC-Challenge, HumanEval, ParEval, and BabelTower datasets
 
 ## Installation
 
@@ -47,13 +47,24 @@ mot/
 ├── mixture_of_thoughts.py    # Core MoT framework implementation
 ├── training.py               # Training utilities and loss functions
 ├── train_ddp.py             # Distributed training script
-├── dataset_loaders.py       # Dataset loading utilities
+├── train_cuda.py            # C++ to CUDA translation training script
+├── evaluate.py              # General evaluation script
+├── evaluate_babeltower.py   # BabelTower benchmark evaluation script
+├── cuda_dataset.py          # CUDA dataset loading utilities
+├── cuda_evaluation.py       # CUDA code evaluation metrics
+├── dataset_loaders.py       # General dataset loading utilities
 ├── utils.py                 # Helper functions and utilities
 ├── example.py               # Usage examples
 ├── configs/                 # Configuration files
 │   └── routerdc_mot_config.json
 ├── experiments/             # Experiment results and checkpoints
 ├── logs/                    # Training logs
+├── BabelTower/              # BabelTower dataset
+│   └── dataset/
+│       ├── cpp.para.test.tok
+│       ├── cpp.para.valid.tok
+│       ├── cuda.para.test.tok
+│       └── cuda.para.valid.tok
 ├── pareval/                 # ParEval benchmark integration
 │   ├── generate_pareval.py  # Code generation script
 │   ├── evaluate_pareval.py  # Evaluation script
@@ -162,6 +173,158 @@ The framework includes loaders for the following benchmark datasets:
 - **ARC-Challenge**: AI2 Reasoning Challenge
 - **HumanEval**: Code generation benchmark
 - **ParEval**: Parallel code generation benchmark (see below)
+- **BabelTower**: C-to-CUDA auto-parallelized program translation benchmark (see below)
+
+## BabelTower Benchmark Evaluation
+
+The MoT framework includes integration with [BabelTower](https://proceedings.mlr.press/v162/wen22b.html), a benchmark for evaluating auto-parallelized program translation from sequential C to parallel CUDA code.
+
+### Dataset Setup
+
+1. Download the BabelTower dataset and place it in the `BabelTower/dataset/` directory:
+```
+mot/BabelTower/dataset/
+├── cpp.para.test.tok      # C++ test set (180 samples)
+├── cpp.para.valid.tok     # C++ validation set (184 samples)
+├── cuda.para.test.tok     # CUDA test set (180 samples)
+└── cuda.para.valid.tok    # CUDA validation set (184 samples)
+```
+
+2. Verify dataset integrity:
+```bash
+python check_dataset.py
+```
+
+### Quick Start
+
+```bash
+# Basic evaluation on test set
+python evaluate_babeltower.py
+
+# Evaluate with specific checkpoint
+python evaluate_babeltower.py \
+    --checkpoint_path ./cuda_mot_output/best_model.pt \
+    --split test
+
+# Quick test with limited samples
+python evaluate_babeltower.py --num_samples 10
+
+# Full MoT generation mode (slower but more accurate)
+python evaluate_babeltower.py --use_mot_generate
+```
+
+### Command Line Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--dataset_dir` | `./BabelTower/dataset` | Path to BabelTower dataset directory |
+| `--checkpoint_path` | `./cuda_mot_output/best_model.pt` | Path to trained MoT model checkpoint |
+| `--output_dir` | `./babeltower_eval_output` | Directory to save evaluation results |
+| `--split` | `test` | Dataset split to evaluate (`test` or `valid`) |
+| `--num_samples` | `None` (all) | Number of samples to evaluate (for quick testing) |
+| `--max_new_tokens` | `256` | Maximum number of tokens to generate |
+| `--temperature` | `0.7` | Sampling temperature for generation |
+| `--top_p` | `0.95` | Top-p (nucleus) sampling parameter |
+| `--use_mot_generate` | `False` | Use full MoT generation with expert interaction |
+| `--no_mot_generate` | - | Disable MoT generation (use fast mode) |
+| `--use_4bit` | `True` | Enable 4-bit quantization |
+| `--use_8bit` | `False` | Enable 8-bit quantization |
+| `--single_gpu` | `True` | Load all models on single GPU |
+| `--check_compilation` | `True` | Check CUDA syntax validity |
+| `--save_predictions` | `True` | Save detailed predictions to JSON |
+| `--seed` | `42` | Random seed for reproducibility |
+
+### Precision Settings
+
+Match your evaluation precision with training settings:
+
+| Training Setting | Evaluation Command |
+|-----------------|-------------------|
+| 4-bit quantization | `--use_4bit` (default) |
+| 8-bit quantization | `--use_8bit` |
+| fp16 (half precision) | Do not specify `--use_4bit` or `--use_8bit` |
+
+**Note**: If you trained with fp16, modify `DEFAULT_CONFIG` in `evaluate_babeltower.py`:
+```python
+DEFAULT_CONFIG = {
+    ...
+    'use_4bit': False,  # Set to False for fp16
+    'use_8bit': False,
+    ...
+}
+```
+
+### Evaluation Metrics
+
+The evaluation script implements metrics from the BabelTower paper:
+
+| Metric | Description |
+|--------|-------------|
+| **BLEU** | Standard n-gram matching score (0-100) |
+| **CodeBLEU** | Code-specific metric considering syntax and data flow |
+| **ParaBLEU** | Parallel semantics metric for CUDA (considers CUDA keywords, loop structure, thread indexing patterns) |
+| **Compilation Accuracy** | Percentage of generated code with valid CUDA syntax |
+
+### Output Files
+
+After evaluation, results are saved to `--output_dir`:
+
+- `babeltower_<split>_metrics.json`: Evaluation metrics summary
+- `babeltower_<split>_predictions.json`: Detailed predictions for each sample
+
+Example metrics output:
+```json
+{
+  "bleu": 44.57,
+  "codebleu": 60.01,
+  "parableu": 17.62,
+  "compilation_accuracy": 90.0,
+  "num_samples": 180,
+  "expert_usage": {"0": 150, "1": 20, "2": 10},
+  "generation_mode": "fast"
+}
+```
+
+### Example Usage Scenarios
+
+#### 1. Full Evaluation on Test Set
+```bash
+python evaluate_babeltower.py \
+    --dataset_dir ./BabelTower/dataset \
+    --checkpoint_path ./cuda_mot_output/best_model.pt \
+    --split test \
+    --use_mot_generate \
+    --save_predictions
+```
+
+#### 2. Quick Validation Check
+```bash
+python evaluate_babeltower.py \
+    --split valid \
+    --num_samples 20 \
+    --max_new_tokens 128
+```
+
+#### 3. Evaluation with Different Checkpoints
+```bash
+# Evaluate best model
+python evaluate_babeltower.py \
+    --checkpoint_path ./cuda_mot_output/best_model.pt \
+    --output_dir ./eval_best
+
+# Evaluate last epoch model
+python evaluate_babeltower.py \
+    --checkpoint_path ./cuda_mot_output/checkpoint-2000.pt \
+    --output_dir ./eval_last
+```
+
+#### 4. High-Quality Generation (Slower)
+```bash
+python evaluate_babeltower.py \
+    --use_mot_generate \
+    --max_new_tokens 512 \
+    --temperature 0.5
+```
 
 ## ParEval Benchmark Evaluation
 
@@ -270,6 +433,12 @@ This project is licensed under the MIT License. See LICENSE file for details.
 2. **Model Download Failures**: Check network connection and HuggingFace hub access
 3. **DDP Training Issues**: Ensure all GPUs are visible and NCCL is properly installed
 
+### BabelTower Evaluation Issues
+
+1. **Dataset Not Found**: Ensure BabelTower dataset is in `./BabelTower/dataset/`
+2. **Checkpoint Not Found**: Verify the checkpoint path exists
+3. **Low ParaBLEU Score**: This metric heavily penalizes incorrect parallel semantics; check if generated code uses proper CUDA thread indexing
+
 ### Debug Mode
 
 Enable debug logging:
@@ -278,4 +447,11 @@ import logging
 logging.basicConfig(level=logging.DEBUG)
 ```
 
+## References
 
+- **BabelTower**: Wen et al., "BabelTower: Learning to Auto-parallelized Program Translation", ICML 2022
+- **ParEval**: Parallel Code Foundry benchmark for parallel code generation
+
+## Contact
+
+For questions or issues, please open an issue on the repository.
