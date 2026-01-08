@@ -182,11 +182,6 @@ mot/BabelTower/dataset/
 └── cuda.para.valid.tok    # CUDA validation set (184 samples)
 ```
 
-2. Verify dataset integrity:
-```bash
-python check_dataset.py
-```
-
 ### Quick Start
 
 ```bash
